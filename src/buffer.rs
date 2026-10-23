@@ -1,7 +1,11 @@
+use crate::Error;
 use crate::arch::Queue;
 use crate::crc32::CRC32;
 use crate::id::CspId;
-use crate::*;
+
+const CSP_BUFFER_SIZE: usize = 256;
+const CSP_BUFFER_COUNT: usize = 15;
+const CSP_PACKET_PADDING_BYTES: usize = 8;
 
 static PACKET_QUEUE: Queue<usize, CSP_BUFFER_COUNT> = Queue::new();
 static mut PACKET_POOL: [Packet; CSP_BUFFER_COUNT] = unsafe { core::mem::zeroed() };
@@ -32,8 +36,7 @@ pub struct Packet {
     /// CSP id (unpacked version CPU readable)
     pub(crate) id: CspId,
 
-    pub(crate) next: Option<&'static mut Packet>,
-
+    // next: Option<&'static mut Packet>,
     /// Additional header bytes, to prepend packed data before transmission
     /// This must be minimum 6 bytes to accommodate CSP 2.0. But some implementations
     /// require much more scratch working area for encryption for example.
@@ -52,13 +55,13 @@ const _: () = {
     );
 };
 
-impl Packet {
-    pub(crate) fn buffer_init() {
-        for i in 0..CSP_BUFFER_COUNT {
-            PACKET_QUEUE.push_blocking(i);
-        }
+pub(crate) fn buffer_init() {
+    for i in 0..CSP_BUFFER_COUNT {
+        PACKET_QUEUE.push_blocking(i);
     }
+}
 
+impl Packet {
     pub(crate) async fn get() -> &'static mut Self {
         unsafe {
             let offset = PACKET_QUEUE.pop().await;
@@ -84,11 +87,22 @@ impl Packet {
         self.clear_id();
     }
 
+    pub(crate) async fn buffer_clone(&self) -> &'static mut Self {
+        let clone = Self::get().await;
+        self.copy_to(clone);
+
+        return clone;
+    }
+
+    pub(crate) fn copy_to(&self, buffer: &mut Packet) {
+        unsafe { core::ptr::copy(self, buffer, 1) };
+    }
+
     /// returns the updated packet length if successful,
     /// Error if out of memory
-    pub fn append_data(&mut self, data: &[u8]) -> Result<usize, ()> {
+    pub fn append_data(&mut self, data: &[u8]) -> Result<usize, Error> {
         if self.length as usize + data.len() > CSP_BUFFER_SIZE {
-            return Err(());
+            return Err(Error::BufferOverflow);
         }
 
         // get destination slice
@@ -102,6 +116,14 @@ impl Packet {
         self.length += data.len() as u16;
 
         return Ok(self.length as usize);
+    }
+
+    pub(crate) fn data_length(&self) -> usize {
+        self.length as _
+    }
+
+    pub(crate) fn data(&self) -> &[u8]{
+        &self.data[..self.data_length()]
     }
 
     pub(crate) fn frame_length(&self) -> usize {
@@ -167,9 +189,12 @@ impl Packet {
         // make sure id is prepended
         self.prepend_id();
 
+        // exclude crc bytes
+        let frame = &self.frame()[..self.frame().len() - size_of::<u32>()];
+
         // calculate CRC
         let mut crc = CRC32::new();
-        crc.update(self.frame());
+        crc.update(frame);
         let crc_value = crc.finish();
 
         // convert to network byte order
@@ -177,7 +202,7 @@ impl Packet {
         // check if equal
         let re = crc_data.eq(&self.get_crc32());
 
-        // Compare calculated checksum with packet header if failed
+        // Compare calculated checksum without packet header if failed
         if !re {
             // calculate CRC without header
             let mut crc = CRC32::new();
@@ -200,7 +225,7 @@ impl Packet {
         let offset = CSP_PACKET_PADDING_BYTES - header.len();
 
         for i in offset..CSP_PACKET_PADDING_BYTES {
-            self.header[i] = header[i]
+            self.header[i] = header[i - offset]
         }
 
         self.header_length = header.len() as _;
@@ -262,5 +287,108 @@ mod tests {
         assert_eq!(packet.length, 7);
 
         assert!(packet.verify_crc32());
+    }
+
+    #[test]
+    fn test_crc32_detects_payload_corruption() {
+        let mut packet: Packet = unsafe { core::mem::zeroed() };
+
+        packet.append_data(&[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+        packet.append_crc32().unwrap();
+
+        packet.data[1] ^= 0xFF;
+
+        assert!(!packet.verify_crc32());
+    }
+
+    #[test]
+    fn test_crc32_detects_crc_corruption() {
+        let mut packet: Packet = unsafe { core::mem::zeroed() };
+
+        packet.append_data(&[1, 2, 3, 4]).unwrap();
+        packet.append_crc32().unwrap();
+
+        let crc_start = packet.length as usize - 4;
+        packet.data[crc_start] ^= 1;
+
+        assert!(!packet.verify_crc32());
+    }
+
+    #[test]
+    fn test_crc32_empty_payload() {
+        let mut packet: Packet = unsafe { core::mem::zeroed() };
+
+        packet.append_crc32().unwrap();
+
+        assert_eq!(packet.length, 4);
+        assert!(packet.verify_crc32());
+    }
+
+    #[test]
+    fn test_crc32_max_payload() {
+        let mut packet: Packet = unsafe { core::mem::zeroed() };
+
+        let data = [0x55; CSP_BUFFER_SIZE - 4];
+
+        packet.append_data(&data).unwrap();
+        packet.append_crc32().unwrap();
+
+        assert_eq!(packet.length as usize, CSP_BUFFER_SIZE);
+        assert!(packet.verify_crc32());
+    }
+
+    #[test]
+    fn test_crc32_no_room() {
+        let mut packet: Packet = unsafe { core::mem::zeroed() };
+
+        let data = [0x55; CSP_BUFFER_SIZE];
+
+        packet.append_data(&data).unwrap();
+
+        assert!(packet.append_crc32().is_err());
+    }
+
+    #[test]
+    fn test_crc32_verify_too_short() {
+        let mut packet: Packet = unsafe { core::mem::zeroed() };
+
+        packet.append_data(&[1, 2, 3]).unwrap();
+
+        assert!(!packet.verify_crc32());
+    }
+
+    #[test]
+    fn test_crc32_detects_header_corruption() {
+        let mut packet: Packet = unsafe { core::mem::zeroed() };
+
+        packet.append_data(&[1, 2, 3]).unwrap();
+        packet.append_crc32().unwrap();
+
+        packet.id.dst ^= 1;
+
+        assert!(!packet.verify_crc32());
+    }
+
+    #[test]
+    fn test_crc32_after_strip_id() {
+        let mut packet: Packet = unsafe { core::mem::zeroed() };
+
+        packet.append_data(&[1, 2, 3, 4]).unwrap();
+        packet.append_crc32().unwrap();
+
+        packet.strip_id();
+
+        assert!(packet.verify_crc32());
+    }
+
+    #[test]
+    fn test_append_data_overflow() {
+        let mut packet: Packet = unsafe { core::mem::zeroed() };
+
+        let data = [0u8; CSP_BUFFER_SIZE];
+
+        packet.append_data(&data).unwrap();
+
+        assert!(packet.append_data(&[1]).is_err());
     }
 }

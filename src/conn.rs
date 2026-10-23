@@ -1,7 +1,14 @@
+use bitflags::bitflags;
+
 use crate::arch::Queue;
 use crate::id::CspId;
+use crate::io::Socket;
 use crate::rdp::*;
 use crate::*;
+
+pub(crate) const CSP_CONN_RXQUEUE_LEN: usize = 16;
+const CSP_PORT_MAX_BIND: u8 = 16;
+const CSP_CONN_MAX: usize = 8;
 
 // Connection queue
 static CONN_QUEUE: Queue<usize, CSP_CONN_MAX> = Queue::new();
@@ -20,6 +27,28 @@ pub(crate) enum ConnState {
 pub(crate) enum ConnType {
     Client,
     Server,
+}
+
+bitflags! {
+    /// CSP Connect options
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct ConnOptions: u32{
+        /// No connection options
+        const CSP_O_NONE = 0x0000;
+        /// Enable RDP
+        const CSP_O_RDP = 0x0001;
+        /// Disable RDP
+        const CSP_O_NORDP = 0x0002;
+        /// Enable HMAC
+        const CSP_O_HMAC = 0x0004;
+        /// Disable HMAC
+        const CSP_O_NOHMAC = 0x0008;
+        /// Enable CRC32
+        const CSP_O_CRC32 = 0x0040;
+        /// Disable CRC32
+        const CSP_O_NOCRC32 = 0x0080;
+        const CSP_O_SAME = 0x8000;
+    }
 }
 
 const CSP_RDP_CLOSED_BY_USERSPACE: u8 = 0x01;
@@ -54,30 +83,30 @@ pub(crate) struct Connection {
     rdp: RdpConnection,
 }
 
+pub(crate) fn check_timeouts() {
+    #[cfg(feature = "rdp")]
+    for i in 0..CSP_CONN_MAX {
+        let conn = unsafe { &mut CONN_POOL[i] };
+        if conn.conn_state == ConnState::Open {
+            todo!() // csp_rdp_check_timeouts(conn);
+        }
+    }
+}
+
+pub(crate) fn init() {
+    for i in 0..CSP_CONN_MAX {
+        let conn = unsafe { &mut CONN_POOL[i] };
+
+        conn.sport_outgoing = CSP_PORT_MAX_BIND + 1 + i as u8;
+        conn.conn_state = ConnState::Closed;
+        conn.idin.flags = Flags::empty();
+        conn.rx_queue = Some(Queue::new());
+
+        CONN_QUEUE.push_blocking(i);
+    }
+}
+
 impl Connection {
-    pub(crate) fn check_timeouts() {
-        #[cfg(feature = "rdp")]
-        for i in 0..CSP_CONN_MAX {
-            let conn = unsafe { &mut CONN_POOL[i] };
-            if conn.conn_state == ConnState::Open {
-                todo!() // csp_rdp_check_timeouts(conn);
-            }
-        }
-    }
-
-    pub(crate) fn init() {
-        for i in 0..CSP_CONN_MAX {
-            let conn = unsafe { &mut CONN_POOL[i] };
-
-            conn.sport_outgoing = CSP_PORT_MAX_BIND + 1 + i as u8;
-            conn.conn_state = ConnState::Closed;
-            conn.idin.flags = Flags::empty();
-            conn.rx_queue = Some(Queue::new());
-
-            CONN_QUEUE.push_blocking(i);
-        }
-    }
-
     pub(crate) fn find_dport(dport: u8) -> Option<&'static mut Connection> {
         // loop over connections
         for i in 0..CSP_CONN_MAX {
@@ -153,7 +182,7 @@ impl Connection {
 
     pub(crate) async fn allocate(conn_type: ConnType) -> &'static mut Connection {
         // wait for next free connection
-        let offset = unsafe { CONN_QUEUE.pop().await };
+        let offset = CONN_QUEUE.pop().await;
         // get connection
         let conn = unsafe { &mut CONN_POOL[offset] };
 
@@ -192,7 +221,7 @@ impl Connection {
         dport: u8,
         timeout: u32,
         mut opts: ConnOptions,
-    ) -> Result<&'static mut Connection, ()> {
+    ) -> Result<&'static mut Connection, Error> {
         // opts |= csp_conf.conn_dfl_so;
 
         // Use 0 as incoming id (this disables the input filter on destination node)
@@ -300,6 +329,18 @@ impl Connection {
         self.conn_state = ConnState::Closed;
     }
 
+    pub(crate) fn set_idout_prio(&mut self, prio: Priority){
+        self.idout.prio = prio
+    }
+
+    pub(crate) fn state(&self) -> ConnState {
+        self.conn_state
+    }
+
+    pub(crate) fn idout(&self) -> &CspId {
+        &self.idout
+    }
+
     pub(crate) fn dport(&self) -> u8 {
         return self.idin.dport;
     }
@@ -328,5 +369,40 @@ impl Connection {
         }
 
         return true;
+    }
+
+    pub async fn read(&self, timeout: u32) -> Result<&'static mut Packet, Error> {
+        let mut timeout = timeout;
+
+        #[cfg(feature = "rdp")]
+        if self.idin.flags.contains(Flags::CSP_FRDP) {
+            timeout = timeout.min(self.rdp.conn_timeout);
+        }
+
+        if timeout == 0 {
+            match self.rx_queue.as_ref().unwrap().try_pop() {
+                Some(p) => return Ok(p),
+                None => return Err(Error::Timeout),
+            }
+        }
+
+        let packet = match self
+            .rx_queue
+            .as_ref()
+            .unwrap()
+            .pop_with_timeout(timeout)
+            .await
+        {
+            Some(v) => v,
+            None => return Err(Error::Timeout),
+        };
+
+        // Packet read could trigger ACK transmission
+        #[cfg(feature = "rdp")]
+        if self.idin.flags.contains(Flags::CSP_FRDP) && self.rdp.delayed_acks > 0 {
+            todo!() // rdp_check_ack(conn)
+        }
+
+        return Ok(packet);
     }
 }

@@ -1,5 +1,8 @@
 use crate::arch::Mutex;
 
+const CSP_RDP_MAX_WINDOW: usize = 5;
+const CSP_RDP_HEADER_SIZE: usize = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RdpState {
     Closed,
@@ -27,9 +30,9 @@ pub(crate) struct RdpConnection {
     /// The last sequence number acknowledged by the receiver
     rcv_lsa: u16,
     window_size: u32,
-    conn_timeout: u32,
+    pub conn_timeout: u32,
     packet_timeout: u32,
-    delayed_acks: u32,
+    pub delayed_acks: u32,
     ack_timeout: u32,
     ack_delay_count: u32,
     ack_timestamp: u32,

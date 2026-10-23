@@ -1,3 +1,5 @@
+use bitflags::bitflags;
+
 /**
  * CSP 2.x
  *
@@ -8,7 +10,6 @@
  * +--------+-----------------------------------+-----------------------------------------+---------------------+-------------------+----------------------+
  *
  */
-use crate::{Flags, Priority};
 
 const CSP_ID2_HOST_SIZE: usize = 14;
 const CSP_ID2_PORT_SIZE: usize = 6;
@@ -27,6 +28,49 @@ const CSP_ID2_FLAGS_MASK: u64 = 0x3F;
 const CSP_ID2_FLAGS_OFFSET: usize = 0;
 
 const CSP_ID2_HEADER_SIZE: usize = 6;
+
+/// Message priority
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    Critical = 0,
+    High = 1,
+    /// Normal (default)
+    Normal = 2,
+    Low = 3,
+}
+
+impl Priority {
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Critical,
+            1 => Self::High,
+            2 => Self::Normal,
+            3 => Self::Low,
+            _ => unreachable!(),
+        }
+    }
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct Flags: u8{
+        /// Reserved for future use
+        const CSP_FRES1 = 0x80;
+        /// Reserved for future use
+        const CSP_FRES2 = 0x40;
+        /// Reserved for future use
+        const CSP_FRES3 = 0x20;
+        /// Use fragmentation
+        const CSP_FFRAG = 0x10;
+        /// Use HMAC verification
+        const CSP_FHMAC = 0x08;
+        /// Use RDP protocol
+        const CSP_FRDP = 0x02;
+        /// Use CRC32 checksum
+        const CSP_FCRC32 = 0x01;
+    }
+}
 
 /// CSP identifier/header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +125,7 @@ pub fn get_host_bits() -> usize {
     CSP_ID2_HOST_SIZE
 }
 
-pub fn get_max_nodeid() -> usize {
+pub fn get_max_nodeid() -> u16 {
     (1 << CSP_ID2_HOST_SIZE) - 1
 }
 

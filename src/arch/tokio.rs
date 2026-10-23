@@ -1,5 +1,7 @@
 extern crate alloc;
 
+use core::time::Duration;
+
 use alloc::collections::VecDeque;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -167,6 +169,13 @@ impl<T, const N: usize> Queue<T, N> {
             // Reset the future in case another call to
             // `try_recv` got the message before us.
             future.set(self.notify.notified());
+        }
+    }
+
+    pub async fn pop_with_timeout(&self, timeout: u32) -> Option<T> {
+        match tokio::time::timeout(Duration::from_millis(timeout as _), self.pop()).await {
+            Ok(v) => Some(v),
+            Err(_) => None,
         }
     }
 }

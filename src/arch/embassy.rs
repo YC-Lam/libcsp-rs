@@ -71,4 +71,13 @@ impl<T, const N: usize> Queue<T, N> {
     pub fn try_pop(&self) -> Option<T> {
         self.inner.try_receive().ok()
     }
+
+    pub async fn pop_with_timeout(&self, timeout: u32) -> Option<T> {
+        embassy_time::with_timeout(
+            embassy_time::Duration::from_millis(timeout as _),
+            self.pop(),
+        )
+        .await
+        .ok()
+    }
 }
