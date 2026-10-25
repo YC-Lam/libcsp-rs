@@ -247,11 +247,16 @@ impl InterfacePrivate {
         }
     }
 
+    /// binds the dyn Interface address for easy access.
+    /// This must be called before any method call
     fn bind(&mut self, iface: *mut dyn Interface) {
         self.iface = Some(iface)
     }
 
+    /// get the parent Interface reference.
+    /// This will panic if bind was not called beforehand
     fn inner(&self) -> &'static mut dyn Interface {
+        // unsafe required to convert pointer as reference
         self.iface
             .and_then(|i| unsafe { i.as_mut() })
             .expect("Interface not registered")
@@ -269,10 +274,13 @@ impl InterfacePrivate {
         self.inner().name()
     }
 
+    /// is default interface (csp supports multiple defaults)
     pub(crate) fn is_default(&self) -> bool {
+        // check if is_default has been override
         self.inner().is_default() || self.override_default
     }
 
+    /// check if interface is within address subnet
     pub(crate) fn is_within_subnet(&self, addr: u16) -> bool {
         // calculate netmask
         let netmask =
@@ -290,7 +298,8 @@ impl InterfacePrivate {
         packet: &Packet,
         from_me: bool,
     ) -> Result<(), Error> {
-        if let Some(can_iface) = (self.inner() as &mut dyn Any).downcast_mut::<()>() {
+        let iface = self.inner() as &mut dyn Any;
+        if let Some(can_iface) = iface.downcast_mut::<()>() {
             todo!()
         } else {
             self.inner().next_hop(via, packet, from_me)
@@ -298,6 +307,7 @@ impl InterfacePrivate {
     }
 }
 
+/// Linked list to store Interfaces
 pub(crate) struct IfList {
     iface: AtomicPtr<InterfacePrivate>,
 }
@@ -315,11 +325,16 @@ impl IfList {
     }
 
     fn last(&self) -> Option<&InterfacePrivate> {
+        // get starting interface pointer
         let mut next = self.iface.load(Ordering::Acquire);
 
+        // unsafe required to convert pointer to refernce
+        // iterate linked list
         while let Some(iface) = unsafe { next.as_ref() } {
+            // get next pointer
             next = iface.next.load(Ordering::Acquire);
 
+            // end when pointer is null
             if next.is_null() {
                 return Some(iface);
             }
@@ -328,9 +343,12 @@ impl IfList {
         return None;
     }
 
+    /// Add interface to IfList.
+    /// This will also setup InterfacePrivate
     fn add(&self, iface: &'static mut dyn Interface) -> InterfaceID {
         let ptr = iface as *mut dyn Interface;
         let new = iface.private();
+        // bind parent Interface to InterfacePrivate
         new.bind(ptr);
 
         new.removed.store(false, Ordering::Release);

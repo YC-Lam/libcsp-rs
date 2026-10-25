@@ -227,14 +227,14 @@ async fn send_direct_iface(
     return Ok(());
 }
 
-async fn send(conn: &Connection, packet: &'static mut Packet) -> Result<(), Error> {
+pub(crate) async fn send(conn: &Connection, packet: &'static mut Packet) -> Result<(), Error> {
     if conn.state() != ConnState::Open {
         packet.free();
         return Err(Error::ConnectionClosed);
     }
 
     #[cfg(feature = "rdp")]
-    if conn.idout().flags.contains(Flags::CSP_FRDP){
+    if conn.idout().flags.contains(Flags::CSP_FRDP) {
         todo!() // if let Err(e) = rdp_send(conn, packet){
         // packet.free();
         // return Err(e)
@@ -244,158 +244,136 @@ async fn send(conn: &Connection, packet: &'static mut Packet) -> Result<(), Erro
     send_direct(conn.idout(), packet, None).await
 }
 
-async fn send_prio(prio: Priority, conn: &mut Connection, packet: &'static mut Packet) -> Result<(), Error>{
+async fn send_prio(
+    prio: Priority,
+    conn: &mut Connection,
+    packet: &'static mut Packet,
+) -> Result<(), Error> {
     conn.set_idout_prio(prio);
     send(conn, packet).await
 }
 
 /// Perform an entire request & reply transaction on an existing connection.
-/// 
+///
 /// Send outbuf, wait for reply and copy reply to inbuf.
-async fn transaction_persistent(conn: &Connection, timeout: u32, inbuf: &[u8], outbuf: &mut [u8]) -> Result<usize, Error>{
+async fn transaction_persistent(
+    conn: &Connection,
+    timeout: u32,
+    inbuf: &[u8],
+    outbuf: &mut [u8],
+) -> Result<usize, Error> {
     // allocate packet
-	let mut packet = Packet::get().await;
+    let mut packet = Packet::get().await;
 
-	// Copy the request
-	packet.append_data(inbuf)?;
+    // Copy the request
+    packet.append_data(inbuf)?;
 
-	send(conn, packet).await?;
+    send(conn, packet).await?;
 
-	// If no reply is expected, return now
-	if outbuf.len() == 0{
+    // If no reply is expected, return now
+    if outbuf.len() == 0 {
         return Ok(0);
     }
-	packet = conn.read(timeout).await?;
+    packet = conn.read(timeout).await?;
 
-	if packet.data_length() > outbuf.len() {
-		packet.free();
-		return Err(Error::BufferOverflow);
-	}
+    if packet.data_length() > outbuf.len() {
+        packet.free();
+        return Err(Error::BufferOverflow);
+    }
 
     // copy data to out buffer
     outbuf[..packet.data_length()].copy_from_slice(packet.data());
-	
+
     let length = packet.data_length();
     packet.free();
 
-	return Ok(length);
+    return Ok(length);
 }
 
 /// Perform an entire request & reply transaction.
-/// 
+///
 /// Creates a connection, send outbuf, wait for reply, copy reply to inbuf and close the connection.
-async fn transaction_w_opts(prio: Priority, dest: u16, port: u8, timeout: u32, outbuf: &[u8], inbuf: &mut [u8], opts: ConnOptions) -> Result<usize, Error>{
+async fn transaction_w_opts(
+    prio: Priority,
+    dest: u16,
+    port: u8,
+    timeout: u32,
+    outbuf: &[u8],
+    inbuf: &mut [u8],
+    opts: ConnOptions,
+) -> Result<usize, Error> {
+    let conn = Connection::connect(prio, dest, port, timeout, opts).await?;
 
-	let conn = Connection::connect(prio, dest, port, timeout, opts).await?;
+    let length = transaction_persistent(conn, timeout, outbuf, inbuf).await?;
 
-	let length = transaction_persistent(conn, timeout, outbuf, inbuf).await?;
+    conn.close();
 
-	conn.close();
-
-	return Ok(length);
+    return Ok(length);
 }
 
-async fn send_to(prio: Priority, dest: u16, dport: u8, src_port: u8, opts: ConnOptions, packet: &'static mut Packet) -> Result<(), Error>{
+async fn send_to(
+    prio: Priority,
+    dest: u16,
+    dport: u8,
+    src_port: u8,
+    opts: ConnOptions,
+    packet: &'static mut Packet,
+) -> Result<(), Error> {
     // reset flags if not same
-	if !opts.contains(ConnOptions::CSP_O_SAME){
+    if !opts.contains(ConnOptions::CSP_O_SAME) {
         packet.id.flags = Flags::empty();
     }
 
-	if opts.contains(ConnOptions::CSP_O_RDP) {
-		packet.free();
-		return Err(Error::InvalidOperation);
-	}
+    if opts.contains(ConnOptions::CSP_O_RDP) {
+        packet.free();
+        return Err(Error::InvalidOperation);
+    }
 
-	if opts.contains(ConnOptions::CSP_O_HMAC) {
-        if cfg!(feature = "hmac"){
+    if opts.contains(ConnOptions::CSP_O_HMAC) {
+        if cfg!(feature = "hmac") {
             packet.id.flags |= Flags::CSP_FHMAC;
-        } else{
+        } else {
             packet.free();
-            return Err(Error::FeatureDisabled)
+            return Err(Error::FeatureDisabled);
         }
-	}
+    }
 
-	if opts.contains(ConnOptions::CSP_O_CRC32) {
-		packet.id.flags |= Flags::CSP_FCRC32;
-	}
+    if opts.contains(ConnOptions::CSP_O_CRC32) {
+        packet.id.flags |= Flags::CSP_FCRC32;
+    }
 
-	packet.id.dst = dest;
-	packet.id.dport = dport;
-	packet.id.sport = src_port;
-	packet.id.prio = prio;
+    packet.id.dst = dest;
+    packet.id.dport = dport;
+    packet.id.sport = src_port;
+    packet.id.prio = prio;
 
     let id = packet.id.clone();
 
-	send_direct(&id, packet, None).await
+    send_direct(&id, packet, None).await
 }
 
-async fn sendto_reply(request_packet: &'static mut Packet, reply_packet: &'static mut Packet, opts: ConnOptions) -> Result<(), Error>{
+async fn sendto_reply(
+    request_packet: &'static mut Packet,
+    reply_packet: &'static mut Packet,
+    opts: ConnOptions,
+) -> Result<(), Error> {
     // check same
-	if opts.contains(ConnOptions::CSP_O_SAME) {
-		reply_packet.id.flags = request_packet.id.flags;
-	}
-	let dst = request_packet.id.src;
-	if request_packet.id.dst != crate::id::get_max_nodeid() {
-		reply_packet.id.src = request_packet.id.dst;
-	} else {
-		reply_packet.id.src = 0;
-	}
-	send_to(request_packet.id.prio, dst, request_packet.id.sport, request_packet.id.dport, opts, reply_packet).await
-}
-
-bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct SocketOptions: u32{
-        /// No socket options
-        const CSP_SO_NONE = 0x0000;
-        /// Require RDP
-        const CSP_SO_RDPREQ = 0x0001;
-        /// Prohibit RDP
-        const CSP_SO_RDPPROHIB = 0x0002;
-        /// Require HMAC
-        const CSP_SO_HMACREQ = 0x0004;
-        /// Prohibit HMAC
-        const CSP_SO_HMACPROHIB = 0x0008;
-        /// Require CRC32
-        const CSP_SO_CRC32REQ = 0x0040;
-        /// Prohibit CRC32
-        const CSP_SO_CRC32PROHIB = 0x0080;
-        /// Enable Connection Less mode
-        const CSP_SO_CONN_LESS = 0x0100;
-        /// Copy opts from incoming packet only applies to csp_sendto_reply()
-        const CSP_SO_SAME = 0x8000;
+    if opts.contains(ConnOptions::CSP_O_SAME) {
+        reply_packet.id.flags = request_packet.id.flags;
     }
-}
-
-pub(crate) struct Socket {
-    pub(crate) rx_queue: arch::Queue<&'static mut Connection, CSP_CONN_RXQUEUE_LEN>,
-    pub(crate) opts: SocketOptions,
-}
-
-impl Socket {
-    pub async fn accept(&self, timeout: u32) -> Result<&'static mut Connection, Error> {
-        match self.rx_queue.pop_with_timeout(timeout).await {
-            Some(conn) => Ok(conn),
-            None => Err(Error::Timeout),
-        }
+    let dst = request_packet.id.src;
+    if request_packet.id.dst != crate::id::get_max_nodeid() {
+        reply_packet.id.src = request_packet.id.dst;
+    } else {
+        reply_packet.id.src = 0;
     }
-
-    ///  Read data from a connection-less server socket.
-    pub async fn recv_packet(&self, timeout: u32) -> Result<&'static Packet, Error>{
-        // 
-        if !self.opts.contains(SocketOptions::CSP_SO_CONN_LESS){
-            return Err(Error::InvalidOperation)
-        }
-
-        let ptr = match self.rx_queue.pop_with_timeout(timeout).await{
-            Some(ptr) => ptr,
-            None => return Err(Error::Timeout)
-        };
-        unsafe{
-            // cast as packet
-            let packet = (ptr as *mut _ as *mut Packet).as_mut_unchecked();
-
-            return Ok(packet)
-        }
-    }
+    send_to(
+        request_packet.id.prio,
+        dst,
+        request_packet.id.sport,
+        request_packet.id.dport,
+        opts,
+        reply_packet,
+    )
+    .await
 }

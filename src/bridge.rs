@@ -4,6 +4,7 @@ static mut BIF_A: Option<InterfaceID> = None;
 static mut BIF_B: Option<InterfaceID> = None;
 
 pub fn csp_bridge_set_interfaces(if_a: InterfaceID, if_b: InterfaceID) {
+    // unsafe required to access static mut
     unsafe {
         BIF_A = Some(if_a);
         BIF_B = Some(if_b);
@@ -11,8 +12,9 @@ pub fn csp_bridge_set_interfaces(if_a: InterfaceID, if_b: InterfaceID) {
 }
 
 pub fn csp_bridge_work() {
+    // unsafe required to access static mut
     let (bif_a, bif_b) = unsafe {
-        match unsafe { (BIF_A, BIF_B) } {
+        match (BIF_A, BIF_B) {
             (Some(a), Some(b)) => (a, b),
             _ => {
                 todo!(); //csp_print(

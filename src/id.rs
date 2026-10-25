@@ -119,21 +119,30 @@ impl CspId {
             ),
         }
     }
+
+    pub(crate) fn clear(&mut self){
+        self.prio = Priority::Critical;
+        self.flags = Flags::empty();
+        self.src = 0;
+        self.dst = 0;
+        self.sport = 0;
+        self.dport = 0;
+    }
 }
 
-pub fn get_host_bits() -> usize {
+pub const fn get_host_bits() -> usize {
     CSP_ID2_HOST_SIZE
 }
 
-pub fn get_max_nodeid() -> u16 {
+pub const fn get_max_nodeid() -> u16 {
     (1 << CSP_ID2_HOST_SIZE) - 1
 }
 
-pub fn get_max_port() -> usize {
+pub const fn get_max_port() -> usize {
     (1 << CSP_ID2_PORT_SIZE) - 1
 }
 
-pub fn get_header_size() -> usize {
+pub const fn get_header_size() -> usize {
     CSP_ID2_HEADER_SIZE
 }
 

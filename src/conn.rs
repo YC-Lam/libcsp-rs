@@ -2,7 +2,7 @@ use bitflags::bitflags;
 
 use crate::arch::Queue;
 use crate::id::CspId;
-use crate::io::Socket;
+use crate::port::Socket;
 use crate::rdp::*;
 use crate::*;
 
@@ -12,10 +12,8 @@ const CSP_CONN_MAX: usize = 8;
 
 // Connection queue
 static CONN_QUEUE: Queue<usize, CSP_CONN_MAX> = Queue::new();
-/// Connection pool
+/// Connection pool, Connections are zeroed and initialised by init()
 static mut CONN_POOL: [Connection; CSP_CONN_MAX] = unsafe { core::mem::zeroed() };
-/// Used by csp_conn_allocate
-static mut CONN_LAST_GIVEN: u8 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnState {
@@ -58,6 +56,8 @@ const CSP_RDP_CLOSED_BY_ALL: u8 =
     CSP_RDP_CLOSED_BY_USERSPACE | CSP_RDP_CLOSED_BY_PROTOCOL | CSP_RDP_CLOSED_BY_TIMEOUT;
 
 pub(crate) struct Connection {
+    /// used for alloc/dealloc
+    index: u8,
     /// Connection type (CONN_CLIENT or CONN_SERVER)
     conn_type: ConnType,
     /// Connection state (CONN_OPEN or CONN_CLOSED)
@@ -86,6 +86,7 @@ pub(crate) struct Connection {
 pub(crate) fn check_timeouts() {
     #[cfg(feature = "rdp")]
     for i in 0..CSP_CONN_MAX {
+        // unsafe required to access connection pool
         let conn = unsafe { &mut CONN_POOL[i] };
         if conn.conn_state == ConnState::Open {
             todo!() // csp_rdp_check_timeouts(conn);
@@ -97,6 +98,7 @@ pub(crate) fn init() {
     for i in 0..CSP_CONN_MAX {
         let conn = unsafe { &mut CONN_POOL[i] };
 
+        conn.index = i as u8;
         conn.sport_outgoing = CSP_PORT_MAX_BIND + 1 + i as u8;
         conn.conn_state = ConnState::Closed;
         conn.idin.flags = Flags::empty();
@@ -186,6 +188,7 @@ impl Connection {
         // get connection
         let conn = unsafe { &mut CONN_POOL[offset] };
 
+        conn.conn_state = ConnState::Open;
         conn.timestamp = 0;
         conn.conn_type = conn_type;
         conn.idin.flags = Flags::empty();
@@ -234,18 +237,18 @@ impl Connection {
             prio,
             flags: Flags::empty(),
             src: dest,
+            sport: dport,
             dst: 0,
             dport: 0,
-            sport: dport,
         };
 
         let mut outgoing_id = CspId {
             prio,
             flags: Flags::empty(),
             src: 0,
+            sport: 0,
             dst: dest,
             dport: dport,
-            sport: 0,
         };
 
         if opts.contains(ConnOptions::CSP_O_NOCRC32) {
@@ -327,9 +330,10 @@ impl Connection {
         }
 
         self.conn_state = ConnState::Closed;
+        CONN_QUEUE.push_blocking(self.index as usize);
     }
 
-    pub(crate) fn set_idout_prio(&mut self, prio: Priority){
+    pub(crate) fn set_idout_prio(&mut self, prio: Priority) {
         self.idout.prio = prio
     }
 

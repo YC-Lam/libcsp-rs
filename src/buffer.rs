@@ -8,6 +8,8 @@ const CSP_BUFFER_COUNT: usize = 15;
 const CSP_PACKET_PADDING_BYTES: usize = 8;
 
 static PACKET_QUEUE: Queue<usize, CSP_BUFFER_COUNT> = Queue::new();
+/// static memory packet pool, packets are safe to be zeroed.
+/// initialisation is done by buffer_init()
 static mut PACKET_POOL: [Packet; CSP_BUFFER_COUNT] = unsafe { core::mem::zeroed() };
 
 #[repr(C)]
@@ -55,38 +57,46 @@ const _: () = {
     );
 };
 
-pub(crate) fn buffer_init() {
+/// initalise all packet buffers, only called by crate::init()
+pub(super) fn buffer_init() {
     for i in 0..CSP_BUFFER_COUNT {
         PACKET_QUEUE.push_blocking(i);
     }
 }
 
 impl Packet {
+    /// allocate packet from packet pool
     pub(crate) async fn get() -> &'static mut Self {
-        unsafe {
-            let offset = PACKET_QUEUE.pop().await;
-            let packet = &mut PACKET_POOL[offset];
+        // get next packet index
+        let index = PACKET_QUEUE.pop().await;
+        // unsafe required to access packet pool
+        let packet = unsafe { &mut PACKET_POOL[index] };
 
-            packet.index = offset;
-            packet.init();
+        // store index
+        packet.index = index;
+        packet.init();
 
-            return packet;
-        }
+        return packet;
     }
 
+    /// free packet back to packet pool.
+    /// packet should not be used after this call
     pub(crate) fn free(&'static mut self) {
+        // push packet index to queue
         PACKET_QUEUE.push_blocking(self.index);
     }
 
+    /// initialise fields in packet
     pub(crate) fn init(&mut self) {
         // length of data
         self.length = 0;
         // begins in main data
         self.header_length = 0;
-
+        // clear id
         self.clear_id();
     }
 
+    /// allocate a new packet and copy content into buffer
     pub(crate) async fn buffer_clone(&self) -> &'static mut Self {
         let clone = Self::get().await;
         self.copy_to(clone);
@@ -94,7 +104,9 @@ impl Packet {
         return clone;
     }
 
+    /// copy content into other packet
     pub(crate) fn copy_to(&self, buffer: &mut Packet) {
+        // unsafe copy to reduce code
         unsafe { core::ptr::copy(self, buffer, 1) };
     }
 
@@ -122,7 +134,7 @@ impl Packet {
         self.length as _
     }
 
-    pub(crate) fn data(&self) -> &[u8]{
+    pub(crate) fn data(&self) -> &[u8] {
         &self.data[..self.data_length()]
     }
 
@@ -245,7 +257,7 @@ impl Packet {
     }
 
     pub(crate) fn clear_id(&mut self) {
-        todo!()
+        self.id.clear()
     }
 }
 
