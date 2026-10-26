@@ -15,10 +15,12 @@ mod crc32;
 mod dedup;
 mod id;
 mod io;
-mod rdp;
 mod port;
 mod promisc;
 mod qfifo;
+mod rdp;
+mod rdp_queue;
+mod route;
 
 pub use buffer::Packet;
 
@@ -30,15 +32,14 @@ pub use interfaces::{
     Interface, InterfaceID, add_interface, print_interface_list, remove_interface,
 };
 
-pub fn init() {
-    buffer::buffer_init();
-    conn::init();
+pub async fn init() {
+    buffer::buffer_init().await;
 
     qfifo::init();
-    todo!(); // rdp_queue_init()
+    rdp_queue::init();
 
     /* Loopback */
-    // csp_if_lo.netmask = csp_id_get_host_bits();
+    todo!(); // csp_if_lo.netmask = csp_id_get_host_bits();
     // csp_iflist_add(&csp_if_lo);
 }
 
@@ -50,7 +51,8 @@ pub enum Error {
     ConnectionClosed,
     BufferOverflow,
     InvalidOperation,
-    PortBusy
+    PortBusy,
+    AllocError,
 }
 
 const CSP_RTABLE_SIZE: usize = 10;
@@ -102,12 +104,18 @@ impl From<u8> for SocketPort {
 }
 
 pub struct CspStream {
-    conn: &'static mut conn::Connection,
+    peer_addr: u16,
+    peer_port: u8,
+    local_addr: u16,
+    local_port: u8,
+    conn: Option<conn::Connection>,
 }
 
 impl Drop for CspStream {
     fn drop(&mut self) {
-        self.conn.close();
+        if self.conn.is_some() {
+            panic!("Stream must be closed before drop");
+        }
     }
 }
 
@@ -120,51 +128,80 @@ impl CspStream {
     ) -> Result<Self, Error> {
         let conn = conn::Connection::connect(prio, addr, port, u32::MAX, opts).await?;
 
-        return Ok(Self { conn });
+        return Ok(Self {
+            peer_addr: conn.src(),
+            peer_port: conn.sport(),
+            local_addr: conn.dst(),
+            local_port: conn.dport(),
+            conn: Some(conn),
+        });
     }
 
     pub fn peer_addr(&self) -> u16 {
-        self.conn.src()
+        self.peer_addr
     }
 
     pub fn peer_port(&self) -> u8 {
-        self.conn.sport()
+        self.peer_port
     }
 
     pub fn local_addr(&self) -> u16 {
-        self.conn.dst()
+        self.local_addr
     }
 
     pub fn local_port(&self) -> u8 {
-        self.conn.dport()
+        self.local_port
     }
 
     /// Send packet on a connection.
     /// This will fail if data is larger then 256 bytes or 252 bytes with CRC
-    pub async fn send(&self, data: &[u8]) -> Result<usize, Error> {
-        let packet = Packet::get().await;
-        packet.append_data(data)?;
+    pub async fn send(&mut self, data: &[u8]) -> Result<usize, Error> {
+        if let Some(conn) = self.conn.as_mut() {
+            let packet = Packet::get().await;
+            packet.append_data(data)?;
 
-        io::send(self.conn, packet).await?;
+            io::send(conn, packet).await?;
 
-        return Ok(data.len());
+            return Ok(data.len());
+        } else {
+            return Err(Error::ConnectionClosed);
+        }
     }
 
-    pub async fn read(&self, data: &mut [u8], timeout: u32) -> Result<usize, Error> {
-        let packet = self.conn.read(timeout).await?;
+    pub async fn read(&mut self, data: &mut [u8], timeout: u32) -> Result<usize, Error> {
+        if let Some(conn) = self.conn.as_mut() {
+            let packet = conn.read(timeout).await?;
 
-        if packet.data_length() > data.len() {
-            packet.free();
-            return Err(Error::BufferOverflow);
+            if packet.data_length() > data.len() {
+                packet.free().await;
+                return Err(Error::BufferOverflow);
+            }
+            // get packet size
+            let len = packet.data_length();
+            // copy data
+            data[..len].copy_from_slice(packet.data());
+            // free packet
+            packet.free().await;
+
+            return Ok(len);
+        } else {
+            return Err(Error::ConnectionClosed);
         }
-        // get packet size
-        let len = packet.data_length();
-        // copy data
-        data[..len].copy_from_slice(packet.data());
-        // free packet
-        packet.free();
+    }
 
-        return Ok(len);
+    pub fn is_active(&self) -> bool {
+        if let Some(conn) = self.conn.as_ref() {
+            conn.is_active()
+        } else {
+            false
+        }
+    }
+
+    /// This must be called before CspStream is dropped
+    pub async fn close(&mut self) {
+        if let Some(conn) = self.conn.as_mut() {
+            conn.close().await
+        }
     }
 }
 
@@ -179,9 +216,9 @@ impl CspListener {
 
         let mut socket = port::Socket::new();
 
-        socket.bind(match port{
+        socket.bind(match port {
             SocketPort::Any => CSP_ANY,
-            SocketPort::Port(p) => p
+            SocketPort::Port(p) => p,
         })?;
 
         socket.listen(10)?;
@@ -196,6 +233,16 @@ impl CspListener {
     pub async fn accept(&self, timeout: u32) -> Result<CspStream, Error> {
         let conn = self.sock.accept(timeout).await?;
 
-        return Ok(CspStream { conn });
+        return Ok(CspStream {
+            peer_addr: conn.src(),
+            peer_port: conn.sport(),
+            local_addr: conn.dst(),
+            local_port: conn.dport(),
+            conn: Some(conn),
+        });
+    }
+
+    pub async fn close(&mut self){
+        self.sock.close().await
     }
 }

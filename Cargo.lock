@@ -192,6 +192,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
+name = "csp"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "embassy-sync",
+ "embassy-time",
+ "libc",
+ "mach2",
+ "serial_test",
+ "smol",
+ "tokio",
+ "winapi",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -405,21 +420,6 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
-
-[[package]]
-name = "libcsp-rs"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "embassy-sync",
- "embassy-time",
- "libc",
- "mach2",
- "serial_test",
- "smol",
- "tokio",
- "winapi",
-]
 
 [[package]]
 name = "linux-raw-sys"

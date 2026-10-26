@@ -120,7 +120,7 @@ impl CspId {
         }
     }
 
-    pub(crate) fn clear(&mut self){
+    pub(crate) fn clear(&mut self) {
         self.prio = Priority::Critical;
         self.flags = Flags::empty();
         self.src = 0;

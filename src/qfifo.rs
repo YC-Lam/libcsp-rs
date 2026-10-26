@@ -14,12 +14,12 @@ const CSP_QFIFO_LEN: usize = 15;
 
 static QFIFO_QUEUE: Queue<Qfifo, CSP_QFIFO_LEN> = Queue::new();
 
-pub(crate) struct Qfifo{
+pub(crate) struct Qfifo {
     iface: &'static mut InterfacePrivate,
-    packet: &'static mut Packet
+    packet: &'static mut Packet,
 }
 pub(crate) fn init() {
-	// nothing to do
+    // nothing to do
 }
 
 pub(crate) async fn read() -> Option<Qfifo> {
@@ -27,11 +27,7 @@ pub(crate) async fn read() -> Option<Qfifo> {
 }
 
 pub(crate) async fn write(packet: &'static mut Packet, iface: &'static mut InterfacePrivate) {
+    let qfifo = Qfifo { iface, packet };
 
-    let qfifo = Qfifo{
-        iface,
-        packet
-    };
-
-	QFIFO_QUEUE.push(qfifo).await;
+    QFIFO_QUEUE.push(qfifo).await;
 }

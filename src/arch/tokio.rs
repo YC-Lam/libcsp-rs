@@ -4,6 +4,8 @@ use core::time::Duration;
 
 use alloc::collections::VecDeque;
 
+use crate::Error;
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn get_ms() -> u32 {
     unsafe {
@@ -135,16 +137,8 @@ impl<T, const N: usize> Queue<T, N> {
         self.notify.notify_one();
     }
 
-    pub fn push_blocking(&self, item: T) {
-        let mut guard = self.inner.lock_blocking();
-        guard.push_back(item);
-        drop(guard);
-
-        self.notify.notify_one();
-    }
-
-    pub fn try_pop(&self) -> Option<T> {
-        self.inner.lock_blocking().pop_front()
+    pub async fn try_pop(&self) -> Option<T> {
+        self.inner.lock().await.pop_front()
     }
 
     pub async fn pop(&self) -> T {
@@ -156,7 +150,7 @@ impl<T, const N: usize> Queue<T, N> {
             // `None` from `try_pop`.
             future.as_mut().enable();
 
-            if let Some(msg) = self.try_pop() {
+            if let Some(msg) = self.try_pop().await {
                 return msg;
             }
 
@@ -177,5 +171,45 @@ impl<T, const N: usize> Queue<T, N> {
             Ok(v) => Some(v),
             Err(_) => None,
         }
+    }
+
+    pub fn free_capacity(&self) -> usize {
+        usize::MAX
+    }
+}
+
+pub struct Semaphore {
+    inner: tokio::sync::Semaphore,
+}
+
+impl Semaphore {
+    /// Equivalent to csp_bin_sem_init(): initially unlocked.
+    pub const fn new() -> Self {
+        Self {
+            inner: tokio::sync::Semaphore::const_new(1),
+        }
+    }
+
+    /// Equivalent to csp_bin_sem_wait().
+    /// timeout_ms == CSP_MAX_TIMEOUT means wait indefinitely.
+    pub async fn wait(&self, timeout_ms: u32) -> Result<(), Error> {
+        if timeout_ms == u32::MAX {
+            self.wait_inner().await;
+            return Ok(());
+        }
+
+        tokio::time::timeout(Duration::from_millis(timeout_ms as u64), self.wait_inner())
+            .await
+            .map_err(|_| Error::Timeout)
+    }
+
+    async fn wait_inner(&self) {
+        let _ = self.inner.acquire().await;
+    }
+
+    /// Equivalent to csp_bin_sem_post().
+    /// Posting an already available semaphore is a no-op.
+    pub fn post(&self) {
+        self.inner.add_permits(1);
     }
 }

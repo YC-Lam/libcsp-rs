@@ -1,10 +1,14 @@
+use core::sync::atomic::AtomicUsize;
+
 use crate::Error;
 use crate::arch::Queue;
+use crate::conn::ConnectionID;
 use crate::crc32::CRC32;
 use crate::id::CspId;
 
-const CSP_BUFFER_SIZE: usize = 256;
-const CSP_BUFFER_COUNT: usize = 15;
+pub(crate) const CSP_BUFFER_SIZE: usize = 256;
+pub(crate) const CSP_BUFFER_COUNT: usize = 15;
+
 const CSP_PACKET_PADDING_BYTES: usize = 8;
 
 static PACKET_QUEUE: Queue<usize, CSP_BUFFER_COUNT> = Queue::new();
@@ -14,10 +18,14 @@ static mut PACKET_POOL: [Packet; CSP_BUFFER_COUNT] = unsafe { core::mem::zeroed(
 
 #[repr(C)]
 pub struct Packet {
+    ref_count: AtomicUsize,
+
     /// Time the message was sent
     pub timestamp_tx: u32,
     /// Time the message was received
     pub timestamp_rx: u32,
+
+    conn: Option<ConnectionID>,
 
     /// index in packet pool
     index: usize,
@@ -58,9 +66,9 @@ const _: () = {
 };
 
 /// initalise all packet buffers, only called by crate::init()
-pub(super) fn buffer_init() {
+pub(super) async fn buffer_init() {
     for i in 0..CSP_BUFFER_COUNT {
-        PACKET_QUEUE.push_blocking(i);
+        PACKET_QUEUE.push(i).await;
     }
 }
 
@@ -81,17 +89,24 @@ impl Packet {
 
     /// free packet back to packet pool.
     /// packet should not be used after this call
-    pub(crate) fn free(&'static mut self) {
+    pub(crate) async fn free(&'static mut self) {
         // push packet index to queue
-        PACKET_QUEUE.push_blocking(self.index);
+        PACKET_QUEUE.push(self.index).await;
     }
 
     /// initialise fields in packet
     pub(crate) fn init(&mut self) {
+        // clear data
+        self.data.fill(0);
+        self.header.fill(0);
+
         // length of data
         self.length = 0;
         // begins in main data
         self.header_length = 0;
+
+        self.conn = None;
+
         // clear id
         self.clear_id();
     }
@@ -128,6 +143,15 @@ impl Packet {
         self.length += data.len() as u16;
 
         return Ok(self.length as usize);
+    }
+
+    pub fn remove_data(&mut self, len: usize) {
+        if (self.length as usize) < len {
+            self.length = 0;
+            return;
+        }
+
+        self.length -= len as u16;
     }
 
     pub(crate) fn data_length(&self) -> usize {
@@ -259,11 +283,21 @@ impl Packet {
     pub(crate) fn clear_id(&mut self) {
         self.id.clear()
     }
+
+    pub(crate) fn connection(&self) -> Option<ConnectionID>{
+        return self.conn
+    }
+
+    pub(crate) fn set_connection(&mut self, conn: Option<ConnectionID>){
+        self.conn = conn;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::vec;
 
     #[test]
     fn test_packet_frame() {
@@ -402,5 +436,72 @@ mod tests {
         packet.append_data(&data).unwrap();
 
         assert!(packet.append_data(&[1]).is_err());
+    }
+
+    /* https://github.com/libcsp/libcsp/#[serial_test::serial]issues/734 */
+    #[test]
+    #[serial]
+    fn test_alloc_clean_734() {
+        let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+
+        rt.block_on(async{
+            let expected = [0u8;CSP_BUFFER_SIZE];
+
+            crate::init().await;
+
+            /* use all buffer and free them */
+            for _ in 0..CSP_BUFFER_COUNT{
+                let packet = Packet::get().await;
+                packet.data = [0u8;_]; /* clear buffer data */
+                packet.append_data("previous_data!!".as_bytes()).unwrap();  /* put some data inside */
+                packet.free().await;
+            }
+
+            /* access the data of previously used buffers */
+            for _ in 0..CSP_BUFFER_COUNT {
+                let packet = Packet::get().await;
+                assert_eq!(packet.data, expected);
+                assert_eq!(packet.length, 0);
+                packet.free().await;
+            }
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn test_clone_frame_begin_fixed() {
+        let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+
+        rt.block_on(async {
+            buffer_init().await;
+
+            let src = Packet::get().await;
+
+            /* Simulate a packet with no header*/
+            src.append_data("hello".as_bytes()).unwrap();
+
+            /* Add header to simulate a prepared to send packet */
+            src.prepend_id();
+
+            let clone = src.buffer_clone().await;
+
+            /* Verify that the data content is identical */
+            assert_eq!(clone.frame(), src.frame());
+
+            /* Modify source data to verify that pointer not pointing the same area */
+            src.remove_data(6);
+            src.append_data("world".as_bytes())
+                .expect("buffer overflow");
+
+            /* Check that clone is unaffected by src modification */
+            assert_ne!(clone.frame(), src.frame());
+            assert_eq!(clone.frame(), "hello".as_bytes());
+
+            /* Ensure that frame_begin does NOT point to the same address as the original */
+            assert_ne!(clone.frame().as_ptr(), src.frame().as_ptr());
+
+            src.free().await;
+            clone.free().await;
+        })
     }
 }
