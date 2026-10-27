@@ -2,8 +2,6 @@ extern crate alloc;
 
 use core::time::Duration;
 
-use alloc::collections::VecDeque;
-
 use crate::Error;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -116,60 +114,44 @@ impl<'a, T> core::ops::DerefMut for MutexGuard<'a, T> {
 }
 
 pub struct Queue<T, const N: usize> {
-    inner: smol::lock::Mutex<VecDeque<T>>,
-    notify: tokio::sync::Notify,
+    inner: super::LazyLock<(smol::channel::Sender<T>, smol::channel::Receiver<T>)>,
 }
 
 impl<T, const N: usize> Queue<T, N> {
     pub const fn new() -> Self {
         Self {
-            inner: smol::lock::Mutex::new(VecDeque::new()),
-            notify: tokio::sync::Notify::const_new(),
+            inner: super::LazyLock::new(|| smol::channel::bounded(N)),
         }
     }
 
-    pub async fn push(&self, item: T) {
-        let mut guard = self.inner.lock().await;
-        guard.push_back(item);
-
-        drop(guard);
-
-        self.notify.notify_one();
+    pub fn close(&self) {
+        self.inner.0.close();
     }
 
-    pub async fn try_pop(&self) -> Option<T> {
-        self.inner.lock().await.pop_front()
+    pub async fn push(&self, item: T) -> Result<(), Error> {
+        self.inner
+            .0
+            .send(item)
+            .await
+            .map_err(|_| Error::ConnectionClosed)
     }
 
-    pub async fn pop(&self) -> T {
-        let future = self.notify.notified();
-        tokio::pin!(future);
-
-        loop {
-            // Make sure that no wakeup is lost if we get
-            // `None` from `try_pop`.
-            future.as_mut().enable();
-
-            if let Some(msg) = self.try_pop().await {
-                return msg;
-            }
-
-            // Wait for a call to `notify_one`.
-            //
-            // This uses `.as_mut()` to avoid consuming the future,
-            // which lets us call `Pin::set` below.
-            future.as_mut().await;
-
-            // Reset the future in case another call to
-            // `try_recv` got the message before us.
-            future.set(self.notify.notified());
-        }
+    pub fn try_pop(&self) -> Option<T> {
+        self.inner.1.try_recv().ok()
     }
 
-    pub async fn pop_with_timeout(&self, timeout: u32) -> Option<T> {
+    pub async fn pop(&self) -> Result<T, Error> {
+        self.inner
+            .1
+            .recv()
+            .await
+            .map_err(|_| Error::ConnectionClosed)
+    }
+
+    pub async fn pop_with_timeout(&self, timeout: u32) -> Result<T, Error> {
         match tokio::time::timeout(Duration::from_millis(timeout as _), self.pop()).await {
-            Ok(v) => Some(v),
-            Err(_) => None,
+            Ok(v) => v,
+            Err(_) => Err(Error::Timeout),
         }
     }
 
@@ -178,11 +160,11 @@ impl<T, const N: usize> Queue<T, N> {
     }
 }
 
-pub struct Semaphore {
+pub struct Semaphore<const N: usize> {
     inner: tokio::sync::Semaphore,
 }
 
-impl Semaphore {
+impl<const N: usize> Semaphore<N> {
     /// Equivalent to csp_bin_sem_init(): initially unlocked.
     pub const fn new() -> Self {
         Self {

@@ -22,7 +22,7 @@ pub(crate) fn is_duplicate(packet: &mut Packet) -> bool {
 
     unsafe {
         // Check if we have received this packet before, start looking from newest packet
-        let mut i = (DEDUP_IN - 1) % CSP_DEDUP_COUNT;
+        let mut i = DEDUP_IN.wrapping_sub(1) % CSP_DEDUP_COUNT;
 
         for _ in 0..CSP_DEDUP_COUNT {
             // check timestamp
@@ -30,11 +30,11 @@ pub(crate) fn is_duplicate(packet: &mut Packet) -> bool {
                 break;
             }
 
-            if (crc_value == DEDUP_ARRAY[i]) {
+            if crc_value == DEDUP_ARRAY[i] {
                 return true;
             }
 
-            i = (i - 1) & (CSP_DEDUP_COUNT - 1);
+            i = i.wrapping_sub(1) & CSP_DEDUP_COUNT.wrapping_sub(1);
         }
 
         DEDUP_ARRAY[DEDUP_IN] = crc_value;
@@ -43,4 +43,21 @@ pub(crate) fn is_duplicate(packet: &mut Packet) -> bool {
     }
 
     return false;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dedup() {
+        let mut packet = Packet::get().unwrap();
+
+        packet.append_data("hello world".as_bytes()).unwrap();
+
+        let mut cloned = packet.buffer_clone().unwrap();
+
+        assert_eq!(is_duplicate(&mut packet), false);
+        assert_eq!(is_duplicate(&mut cloned), true);
+    }
 }

@@ -29,7 +29,10 @@ pub struct LazyLock<T, F = fn() -> T> {
 unsafe impl<T: Send + Sync, F: Send + Sync> Sync for LazyLock<T, F> {}
 unsafe impl<T: Send, F: Send> Send for LazyLock<T, F> {}
 
-impl<T, F> LazyLock<T, F> where F: FnOnce() -> T {
+impl<T, F> LazyLock<T, F>
+where
+    F: FnOnce() -> T,
+{
     pub const fn new(f: F) -> Self {
         Self {
             state: AtomicU8::new(UNINIT),
@@ -55,12 +58,7 @@ impl<T, F> LazyLock<T, F> where F: FnOnce() -> T {
                 UNINIT => {
                     if self
                         .state
-                        .compare_exchange(
-                            UNINIT,
-                            RUNNING,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
+                        .compare_exchange(UNINIT, RUNNING, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
                         struct Reset<'a>(&'a AtomicU8);
@@ -72,7 +70,7 @@ impl<T, F> LazyLock<T, F> where F: FnOnce() -> T {
                         }
 
                         let reset = Reset(&self.state);
-                        
+
                         // SAFETY: This thread exclusively owns initialization.
                         unsafe {
                             let value = (&mut *self.init.get()).take().unwrap()();
@@ -106,29 +104,35 @@ impl<T, F> Drop for LazyLock<T, F> {
     }
 }
 
-impl<T, F> core::ops::Deref for LazyLock<T, F> where F: FnOnce() -> T{
+impl<T, F> core::ops::Deref for LazyLock<T, F>
+where
+    F: FnOnce() -> T,
+{
     type Target = T;
     fn deref(&self) -> &Self::Target {
         self.get_or_init()
     }
 }
 
-impl<T, F> core::ops::DerefMut for LazyLock<T, F> where F:FnOnce() -> T{
+impl<T, F> core::ops::DerefMut for LazyLock<T, F>
+where
+    F: FnOnce() -> T,
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         let ptr = self.get_or_init() as *const T;
-        return unsafe{(ptr as *mut T).as_mut_unchecked()}
+        return unsafe { (ptr as *mut T).as_mut_unchecked() };
     }
 }
 
 #[cfg(test)]
-mod tests{
+mod tests {
     use super::*;
 
     #[test]
-    fn lazylock_called_once(){
+    fn lazylock_called_once() {
         let mut i = 0;
 
-        let lock = LazyLock::new(||i+=1);
+        let lock = LazyLock::new(|| i += 1);
 
         lock.get_or_init();
         lock.get_or_init();

@@ -1,7 +1,8 @@
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::TrySendError;
-use embassy_sync::signal::Signal;
-use embassy_time::Duration;
+use embassy_sync::semaphore::{GreedySemaphore, Semaphore as _};
 
 use crate::Error;
 
@@ -37,101 +38,158 @@ pub struct MutexGuard<'a, T> {
     inner: embassy_sync::mutex::MutexGuard<'a, CriticalSectionRawMutex, T>,
 }
 
-impl<'a, T> core::ops::Deref for MutexGuard<'a, T> {
+impl<T> Deref for MutexGuard<'_, T> {
     type Target = T;
+
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl<'a, T> core::ops::DerefMut for MutexGuard<'a, T> {
+impl<T> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
 pub struct Queue<T, const N: usize> {
-    inner: embassy_sync::channel::Channel<CriticalSectionRawMutex, T, N>,
+    inner: embassy_sync::channel::Channel<CriticalSectionRawMutex, Option<T>, N>,
+    closed: AtomicBool,
 }
 
 impl<T, const N: usize> Queue<T, N> {
     pub const fn new() -> Self {
         Self {
             inner: embassy_sync::channel::Channel::new(),
+            closed: AtomicBool::new(false),
         }
     }
 
-    pub async fn push(&self, item: T) {
-        self.inner.send(item).await
+    pub async fn push(&self, item: T) -> Result<(), Error> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::ConnectionClosed);
+        }
+
+        self.inner.send(Some(item)).await;
+
+        if self.closed.load(Ordering::Acquire) {
+            self.signal_closed();
+            return Err(Error::ConnectionClosed);
+        }
+
+        Ok(())
     }
 
-    pub async fn pop(&self) -> T {
-        self.inner.receive().await
+    pub fn try_pop(&self) -> Option<T> {
+        match self.inner.try_receive() {
+            Ok(Some(item)) => Some(item),
+            Ok(None) => {
+                self.signal_closed();
+                None
+            }
+            Err(_) => None,
+        }
     }
 
-    pub async fn try_pop(&self) -> Option<T> {
-        self.inner.try_receive().ok()
+    pub async fn pop(&self) -> Result<T, Error> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::ConnectionClosed);
+        }
+
+        match self.inner.receive().await {
+            Some(item) => {
+                if self.closed.load(Ordering::Acquire) {
+                    self.signal_closed();
+                    Err(Error::ConnectionClosed)
+                } else {
+                    Ok(item)
+                }
+            }
+            None => {
+                self.signal_closed();
+                Err(Error::ConnectionClosed)
+            }
+        }
     }
 
-    pub async fn pop_with_timeout(&self, timeout: u32) -> Option<T> {
+    pub async fn pop_with_timeout(&self, timeout: u32) -> Result<T, Error> {
+        if timeout == u32::MAX {
+            return self.pop().await;
+        }
+        if timeout == 0 {
+            return self.try_pop().ok_or(Error::Timeout);
+        }
+
         embassy_time::with_timeout(
-            embassy_time::Duration::from_millis(timeout as _),
+            embassy_time::Duration::from_millis(timeout as u64),
             self.pop(),
         )
         .await
-        .ok()
+        .map_err(|_| Error::Timeout)?
     }
 
     pub fn free_capacity(&self) -> usize {
         self.inner.free_capacity()
     }
-}
 
-pub struct Semaphore {}
-
-impl Semaphore {
-    /// Initially available, equivalent to sem_init(..., 1).
-    pub const fn new() -> Self {
-        Self {
-            available: EmbassyMutex::new(true),
-            notify: Signal::new(),
+    pub fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.signal_closed();
         }
     }
 
-    /// Wait indefinitely or for the specified timeout in milliseconds.
-    ///
-    /// CSP_MAX_TIMEOUT means wait indefinitely.
+    fn signal_closed(&self) {
+        let _ = self.inner.try_send(None);
+    }
+}
+
+pub struct Semaphore<const N: usize> {
+    inner: GreedySemaphore<CriticalSectionRawMutex>,
+}
+
+impl<const N: usize> Semaphore<N> {
+    /// Create an initially available binary semaphore.
+    pub const fn new() -> Self {
+        Self {
+            inner: GreedySemaphore::new(1),
+        }
+    }
+
+    /// Equivalent to csp_bin_sem_wait(). `u32::MAX` waits indefinitely.
     pub async fn wait(&self, timeout_ms: u32) -> Result<(), Error> {
-        if timeout_ms == u32::MAX {
-            self.wait_inner().await;
+        if let Some(permit) = self.inner.try_acquire(1) {
+            permit.disarm();
             return Ok(());
         }
 
-        embassy_time::with_timeout(Duration::from_millis(timeout_ms as u64), self.wait_inner())
-            .await
-            .map_err(|_| Error::Timeout)
+        if timeout_ms == 0 {
+            return Err(Error::Timeout);
+        }
+
+        if timeout_ms == u32::MAX {
+            self.acquire_inner().await;
+            return Ok(());
+        }
+
+        embassy_time::with_timeout(
+            embassy_time::Duration::from_millis(timeout_ms as u64),
+            self.acquire_inner(),
+        )
+        .await
+        .map_err(|_| Error::Timeout)
     }
 
-    async fn wait_inner(&self) {
-        loop {
-            // Check and acquire the binary semaphore atomically.
-            {
-                let mut available = self.available.lock().await;
-
-                if *available {
-                    *available = false;
-                    return;
-                }
+    async fn acquire_inner(&self) {
+        match self.inner.acquire(1).await {
+            Ok(permit) => {
+                permit.disarm();
             }
-
-            // Signal retains a pending notification if no task
-            // is currently waiting. Always recheck the state.
-            self.notify.wait().await;
+            Err(never) => match never {},
         }
     }
 
-    /// Release the semaphore. Repeated posts do not accumulate.
+    /// Release the binary semaphore; repeated posts do not accumulate permits.
     pub fn post(&self) {
-        todo!()
+        self.inner.set(1);
     }
 }

@@ -106,7 +106,7 @@ impl CspId {
     pub(crate) fn from_header(header: &[u8]) -> Self {
         let id2 = u64::from_be_bytes([
             header[0], header[1], header[2], header[3], header[4], header[5], 0, 0,
-        ]);
+        ]) >> 16;
 
         CspId {
             prio: Priority::from_u8(((id2 >> CSP_ID2_PRIO_OFFSET) & CSP_ID2_PRIO_MASK) as u8),

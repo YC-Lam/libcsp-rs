@@ -1,7 +1,6 @@
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::Error;
-use crate::arch::Queue;
 use crate::conn::ConnectionID;
 use crate::crc32::CRC32;
 use crate::id::CspId;
@@ -11,24 +10,23 @@ pub(crate) const CSP_BUFFER_COUNT: usize = 15;
 
 const CSP_PACKET_PADDING_BYTES: usize = 8;
 
-static PACKET_QUEUE: Queue<usize, CSP_BUFFER_COUNT> = Queue::new();
 /// static memory packet pool, packets are safe to be zeroed.
 /// initialisation is done by buffer_init()
-static mut PACKET_POOL: [Packet; CSP_BUFFER_COUNT] = unsafe { core::mem::zeroed() };
+static mut PACKET_POOL: [PacketBuf; CSP_BUFFER_COUNT] = unsafe { core::mem::zeroed() };
 
 #[repr(C)]
-pub struct Packet {
+pub struct PacketBuf {
+    /// reference counter
     ref_count: AtomicUsize,
+    /// index in packet pool
+    index: usize,
+
+    conn: Option<ConnectionID>,
 
     /// Time the message was sent
     pub timestamp_tx: u32,
     /// Time the message was received
     pub timestamp_rx: u32,
-
-    conn: Option<ConnectionID>,
-
-    /// index in packet pool
-    index: usize,
 
     /// Received bytes
     pub(crate) rx_count: u16,
@@ -39,14 +37,14 @@ pub struct Packet {
     /// Timestamp in ms for last use of buffer
     pub(crate) last_used: u32,
 
+    /// CSP id (unpacked version CPU readable)
+    pub(crate) id: CspId,
+
     /// header length
     header_length: u8,
     /// Data length
     length: u16,
-    /// CSP id (unpacked version CPU readable)
-    pub(crate) id: CspId,
 
-    // next: Option<&'static mut Packet>,
     /// Additional header bytes, to prepend packed data before transmission
     /// This must be minimum 6 bytes to accommodate CSP 2.0. But some implementations
     /// require much more scratch working area for encryption for example.
@@ -60,42 +58,42 @@ pub struct Packet {
 // header and data must be continuous
 const _: () = {
     assert!(
-        core::mem::offset_of!(Packet, data)
-            == core::mem::offset_of!(Packet, header) + CSP_PACKET_PADDING_BYTES
+        core::mem::offset_of!(PacketBuf, data)
+            == core::mem::offset_of!(PacketBuf, header) + CSP_PACKET_PADDING_BYTES
     );
 };
 
-/// initalise all packet buffers, only called by crate::init()
-pub(super) async fn buffer_init() {
-    for i in 0..CSP_BUFFER_COUNT {
-        PACKET_QUEUE.push(i).await;
-    }
-}
-
-impl Packet {
+impl PacketBuf {
     /// allocate packet from packet pool
-    pub(crate) async fn get() -> &'static mut Self {
-        // get next packet index
-        let index = PACKET_QUEUE.pop().await;
-        // unsafe required to access packet pool
-        let packet = unsafe { &mut PACKET_POOL[index] };
+    fn get() -> Option<&'static mut Self> {
+        // loop through
+        for i in 0..CSP_BUFFER_COUNT {
+            // unsafe required to access packet pool
+            let packet = unsafe { &mut PACKET_POOL[i] };
 
-        // store index
-        packet.index = index;
-        packet.init();
+            packet.index = i;
 
-        return packet;
+            if packet
+                .ref_count
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                // store index
+                packet.index = i;
+
+                return Some(packet);
+            }
+        }
+
+        None
     }
 
-    /// free packet back to packet pool.
-    /// packet should not be used after this call
-    pub(crate) async fn free(&'static mut self) {
-        // push packet index to queue
-        PACKET_QUEUE.push(self.index).await;
+    fn free(&mut self) {
+        self.ref_count.store(0, Ordering::Release);
     }
 
     /// initialise fields in packet
-    pub(crate) fn init(&mut self) {
+    fn init(&mut self) {
         // clear data
         self.data.fill(0);
         self.header.fill(0);
@@ -111,18 +109,22 @@ impl Packet {
         self.clear_id();
     }
 
-    /// allocate a new packet and copy content into buffer
-    pub(crate) async fn buffer_clone(&self) -> &'static mut Self {
-        let clone = Self::get().await;
-        self.copy_to(clone);
-
-        return clone;
-    }
-
     /// copy content into other packet
-    pub(crate) fn copy_to(&self, buffer: &mut Packet) {
+    fn copy_to(&self, buffer: &mut PacketBuf) {
         // unsafe copy to reduce code
-        unsafe { core::ptr::copy(self, buffer, 1) };
+        buffer.conn = self.conn;
+        buffer.timestamp_rx = self.timestamp_rx;
+        buffer.timestamp_tx = self.timestamp_tx;
+        buffer.rx_count = self.rx_count;
+        buffer.remain = self.remain;
+        buffer.cfpid = self.cfpid;
+        buffer.last_used = self.last_used;
+        buffer.id = self.id;
+        buffer.header_length = self.header_length;
+        buffer.length = self.length;
+
+        buffer.header.copy_from_slice(&self.header);
+        buffer.data.copy_from_slice(&self.data);
     }
 
     /// returns the updated packet length if successful,
@@ -145,7 +147,7 @@ impl Packet {
         return Ok(self.length as usize);
     }
 
-    pub fn remove_data(&mut self, len: usize) {
+    pub(crate) fn remove_data(&mut self, len: usize) {
         if (self.length as usize) < len {
             self.length = 0;
             return;
@@ -158,7 +160,7 @@ impl Packet {
         self.length as _
     }
 
-    pub(crate) fn data(&self) -> &[u8] {
+    pub fn data(&self) -> &[u8] {
         &self.data[..self.data_length()]
     }
 
@@ -183,6 +185,8 @@ impl Packet {
     }
 
     fn get_crc32(&self) -> [u8; 4] {
+        debug_assert!(self.length >= 4);
+
         let mut crc = [0; 4];
         // get data
         for i in 0..4 {
@@ -226,7 +230,8 @@ impl Packet {
         self.prepend_id();
 
         // exclude crc bytes
-        let frame = &self.frame()[..self.frame().len() - size_of::<u32>()];
+        let frame = self.frame();
+        let frame = &frame[..frame.len() - size_of::<u32>()];
 
         // calculate CRC
         let mut crc = CRC32::new();
@@ -256,6 +261,8 @@ impl Packet {
 
     /// convert id into header
     pub(crate) fn prepend_id(&mut self) {
+        self.header.fill(0);
+
         let header = self.id.to_header();
 
         let offset = CSP_PACKET_PADDING_BYTES - header.len();
@@ -275,21 +282,68 @@ impl Packet {
     }
 
     /// extract and store ID, calculate data length
-    pub(crate) fn strip_id(&mut self) {
+    pub(crate) fn strip_id(&mut self) -> bool {
+        if self.frame_length() < crate::id::get_header_size() {
+            return false;
+        }
+
         self.id = CspId::from_header(self.frame());
         self.length = (self.frame_length() - crate::id::get_header_size()) as _;
+
+        return true;
     }
 
     pub(crate) fn clear_id(&mut self) {
         self.id.clear()
     }
 
-    pub(crate) fn connection(&self) -> Option<ConnectionID>{
-        return self.conn
+    pub(crate) fn connection(&self) -> Option<ConnectionID> {
+        return self.conn;
     }
 
-    pub(crate) fn set_connection(&mut self, conn: Option<ConnectionID>){
+    pub(crate) fn set_connection(&mut self, conn: Option<ConnectionID>) {
         self.conn = conn;
+    }
+}
+
+pub struct Packet {
+    inner: &'static mut PacketBuf,
+}
+
+impl Packet {
+    /// Allocate a packet from the fixed buffer pool.
+    pub fn get() -> Option<Self> {
+        let inner = PacketBuf::get()?;
+        let mut packet = Self { inner };
+        packet.init();
+        Some(packet)
+    }
+
+    /// Allocate a packet and copy this packet's contents into it.
+    pub(crate) fn buffer_clone(&self) -> Option<Self> {
+        let mut clone = Self::get()?;
+        self.copy_to(&mut clone);
+        Some(clone)
+    }
+}
+
+impl core::ops::Deref for Packet {
+    type Target = PacketBuf;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner
+    }
+}
+
+impl core::ops::DerefMut for Packet {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+    }
+}
+
+impl Drop for Packet {
+    fn drop(&mut self) {
+        self.inner.free();
     }
 }
 
@@ -301,7 +355,7 @@ mod tests {
 
     #[test]
     fn test_packet_frame() {
-        let mut packet: Packet = unsafe { core::mem::zeroed() };
+        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
 
         packet.header = [0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         packet.header_length = 6;
@@ -322,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_packet_crc32() {
-        let mut packet: Packet = unsafe { core::mem::zeroed() };
+        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
 
         packet.append_data(&[0xAA, 0xBB, 0xCC]).unwrap();
 
@@ -337,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_crc32_detects_payload_corruption() {
-        let mut packet: Packet = unsafe { core::mem::zeroed() };
+        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
 
         packet.append_data(&[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
         packet.append_crc32().unwrap();
@@ -349,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_crc32_detects_crc_corruption() {
-        let mut packet: Packet = unsafe { core::mem::zeroed() };
+        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
 
         packet.append_data(&[1, 2, 3, 4]).unwrap();
         packet.append_crc32().unwrap();
@@ -362,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_crc32_empty_payload() {
-        let mut packet: Packet = unsafe { core::mem::zeroed() };
+        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
 
         packet.append_crc32().unwrap();
 
@@ -372,7 +426,7 @@ mod tests {
 
     #[test]
     fn test_crc32_max_payload() {
-        let mut packet: Packet = unsafe { core::mem::zeroed() };
+        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
 
         let data = [0x55; CSP_BUFFER_SIZE - 4];
 
@@ -385,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_crc32_no_room() {
-        let mut packet: Packet = unsafe { core::mem::zeroed() };
+        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
 
         let data = [0x55; CSP_BUFFER_SIZE];
 
@@ -396,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_crc32_verify_too_short() {
-        let mut packet: Packet = unsafe { core::mem::zeroed() };
+        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
 
         packet.append_data(&[1, 2, 3]).unwrap();
 
@@ -405,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_crc32_detects_header_corruption() {
-        let mut packet: Packet = unsafe { core::mem::zeroed() };
+        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
 
         packet.append_data(&[1, 2, 3]).unwrap();
         packet.append_crc32().unwrap();
@@ -417,7 +471,7 @@ mod tests {
 
     #[test]
     fn test_crc32_after_strip_id() {
-        let mut packet: Packet = unsafe { core::mem::zeroed() };
+        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
 
         packet.append_data(&[1, 2, 3, 4]).unwrap();
         packet.append_crc32().unwrap();
@@ -429,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_append_data_overflow() {
-        let mut packet: Packet = unsafe { core::mem::zeroed() };
+        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
 
         let data = [0u8; CSP_BUFFER_SIZE];
 
@@ -439,69 +493,57 @@ mod tests {
     }
 
     /* https://github.com/libcsp/libcsp/#[serial_test::serial]issues/734 */
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_alloc_clean_734() {
-        let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+    async fn test_alloc_clean_734() {
+        let expected = [0u8; CSP_BUFFER_SIZE];
 
-        rt.block_on(async{
-            let expected = [0u8;CSP_BUFFER_SIZE];
+        /* use all buffer and free them */
+        for _ in 0..CSP_BUFFER_COUNT {
+            let mut packet = Packet::get().unwrap();
+            packet.data = [0u8; _]; /* clear buffer data */
+            packet.append_data("previous_data!!".as_bytes()).unwrap(); /* put some data inside */
+            drop(packet);
+        }
 
-            crate::init().await;
-
-            /* use all buffer and free them */
-            for _ in 0..CSP_BUFFER_COUNT{
-                let packet = Packet::get().await;
-                packet.data = [0u8;_]; /* clear buffer data */
-                packet.append_data("previous_data!!".as_bytes()).unwrap();  /* put some data inside */
-                packet.free().await;
-            }
-
-            /* access the data of previously used buffers */
-            for _ in 0..CSP_BUFFER_COUNT {
-                let packet = Packet::get().await;
-                assert_eq!(packet.data, expected);
-                assert_eq!(packet.length, 0);
-                packet.free().await;
-            }
-        })
+        /* access the data of previously used buffers */
+        for _ in 0..CSP_BUFFER_COUNT {
+            let packet = Packet::get().unwrap();
+            assert_eq!(packet.data, expected);
+            assert_eq!(packet.length, 0);
+            drop(packet);
+        }
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_clone_frame_begin_fixed() {
-        let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+    async fn test_clone_frame_begin_fixed() {
+        let mut src = Packet::get().unwrap();
 
-        rt.block_on(async {
-            buffer_init().await;
+        /* Simulate a packet with no header*/
+        src.append_data("hello".as_bytes()).unwrap();
 
-            let src = Packet::get().await;
+        /* Add header to simulate a prepared to send packet */
+        src.prepend_id();
 
-            /* Simulate a packet with no header*/
-            src.append_data("hello".as_bytes()).unwrap();
+        let clone = src.buffer_clone().unwrap();
 
-            /* Add header to simulate a prepared to send packet */
-            src.prepend_id();
+        /* Verify that the data content is identical */
+        assert_eq!(clone.frame(), src.frame());
 
-            let clone = src.buffer_clone().await;
+        /* Modify source data to verify that pointer not pointing the same area */
+        src.remove_data(6);
+        src.append_data("world".as_bytes())
+            .expect("buffer overflow");
 
-            /* Verify that the data content is identical */
-            assert_eq!(clone.frame(), src.frame());
+        /* Check that clone is unaffected by src modification */
+        assert_ne!(clone.frame(), src.frame());
+        assert_eq!(clone.data(), "hello".as_bytes());
 
-            /* Modify source data to verify that pointer not pointing the same area */
-            src.remove_data(6);
-            src.append_data("world".as_bytes())
-                .expect("buffer overflow");
+        /* Ensure that frame_begin does NOT point to the same address as the original */
+        assert_ne!(clone.frame().as_ptr(), src.frame().as_ptr());
 
-            /* Check that clone is unaffected by src modification */
-            assert_ne!(clone.frame(), src.frame());
-            assert_eq!(clone.frame(), "hello".as_bytes());
-
-            /* Ensure that frame_begin does NOT point to the same address as the original */
-            assert_ne!(clone.frame().as_ptr(), src.frame().as_ptr());
-
-            src.free().await;
-            clone.free().await;
-        })
+        drop(src);
+        drop(clone);
     }
 }

@@ -1,0 +1,570 @@
+#include <csp/interfaces/csp_if_zmqhub.h>
+
+#if (CSP_HAVE_LIBZMQ)
+
+#include <zmq.h>
+#include <assert.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <csp/csp.h>
+#include <csp/csp_debug.h>
+#include <pthread.h>
+
+#include <csp/csp_id.h>
+
+#include "../csp_macro.h"
+#include "../csp_buffer_private.h"
+#include "csp_if_zmqhub_internal.h"
+
+/**
+ * ZMQ destination size (for libcsp1 backwards compatibility)
+ */
+#define ZMQ_DEST_ADDR_SIZE_FIXUP_CSPV1    1
+
+/* ZMQ driver & interface */
+typedef struct {
+	pthread_t rx_thread;
+	void * context;
+	void * publisher;
+	void * subscriber;
+	/* We must allocate filters per interface, as ZMQ does not copy the filter value to the
+		outgoing packet for each setsockopt call. */
+	uint16_t filt[4][3];
+	char name[CSP_IFLIST_NAME_MAX + 1];
+	csp_iface_t iface;
+} zmq_driver_t;
+
+
+#define CURVE_KEYLEN 41
+
+/* Linux is fast, so we keep it simple by having a single lock */
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+size_t csp_zmqhub_raw_header_size(void) {
+
+	return csp_id_get_header_size() + ((csp_conf.version == 1) ? ZMQ_DEST_ADDR_SIZE_FIXUP_CSPV1 : 0);
+}
+
+size_t csp_zmqhub_max_raw_frame_length(void) {
+
+	return csp_zmqhub_raw_header_size() + CSP_ZMQ_MTU;
+}
+
+/**
+ * Add one byte of the dest or "via" address to the beginning of the
+ * ZMQ message for the CSPv1 protocol.
+ *
+ * This extra byte is not used with the CSPv2 protocol.
+ *
+ * @param packet pointer to packet buffer
+ */
+void csp_zmqhub_fixup_cspv1_add_dest_addr(csp_packet_t * packet) {
+
+	if (csp_conf.version == 1) {
+		packet->frame_begin -= ZMQ_DEST_ADDR_SIZE_FIXUP_CSPV1;
+		*(packet->frame_begin) = (uint8_t)packet->id.dst;
+		packet->frame_length += ZMQ_DEST_ADDR_SIZE_FIXUP_CSPV1;
+	}
+}
+
+/**
+ * Skip the extra byte of the dest or "via" address at the beginning
+ * of the ZMQ message for the CSPv1 protocol.
+ *
+ * This extra byte is not used with the CSPv2 protocol.
+ *
+ * @param rx_data pointer to ZMQ message content
+ * @param datalen pointer to ZMQ message content size
+ */
+void * csp_zmqhub_fixup_cspv1_del_dest_addr(uint8_t * rx_data, size_t * datalen) {
+
+	if (csp_conf.version == 1) {
+		rx_data += ZMQ_DEST_ADDR_SIZE_FIXUP_CSPV1;
+		*datalen -= ZMQ_DEST_ADDR_SIZE_FIXUP_CSPV1;
+	}
+
+	return rx_data;
+}
+
+/**
+ * Interface transmit function
+ * @param packet Packet to transmit
+ * @return 1 if packet was successfully transmitted, 0 on error
+ */
+static int csp_zmqhub_tx(csp_iface_t * iface, uint16_t __maybe_unused via, csp_packet_t * packet, int __maybe_unused from_me) {
+
+	zmq_driver_t * drv = iface->driver_data;
+
+	csp_id_prepend_fixup_cspv1(packet);
+	csp_zmqhub_fixup_cspv1_add_dest_addr(packet);
+
+	/**
+	 * While a ZMQ context is thread safe, sockets are NOT threadsafe, so by sharing drv->publisher, we
+	 * need to have a lock around any calls that uses that */
+	pthread_mutex_lock(&lock);
+	int result = zmq_send(drv->publisher, packet->frame_begin, packet->frame_length, 0);
+	pthread_mutex_unlock(&lock);
+
+	if (result < 0) {
+		csp_print("ZMQ send error: %u %s\n", result, zmq_strerror(zmq_errno()));
+	}
+
+	csp_buffer_free(packet);
+
+	return CSP_ERR_NONE;
+}
+
+static int csp_zmqhub_queue_msg(zmq_msg_t * msg, csp_iface_t * iface) {
+
+	const size_t raw_datalen = zmq_msg_size(msg);
+	const size_t raw_header_size = csp_zmqhub_raw_header_size();
+	const size_t max_raw_frame_length = csp_zmqhub_max_raw_frame_length();
+	if (raw_datalen < raw_header_size) {
+		iface->frame++;
+		csp_print("ZMQ RX %s: too short datalen: %zu - expected at least %zu bytes\n", iface->name, raw_datalen, raw_header_size);
+		return CSP_ERR_INVAL;
+	}
+	if (raw_datalen > max_raw_frame_length) {
+		iface->rx_error++;
+		csp_print("ZMQ RX %s: too long datalen: %zu - expected at most %zu bytes\n", iface->name, raw_datalen, max_raw_frame_length);
+		return CSP_ERR_INVAL;
+	}
+
+	size_t datalen = raw_datalen;
+	uint8_t * rx_data = zmq_msg_data(msg);
+	rx_data = csp_zmqhub_fixup_cspv1_del_dest_addr(rx_data, &datalen);
+	csp_id_t csp_id = csp_id_extract_fixup_cspv1(rx_data);
+
+	csp_packet_t * packet;
+	if (csp_iflist_get_by_addr(csp_id.dst) != NULL) {
+		/* The packet is for us, make sure we don't silently ignore the situation if we can't process it */
+		packet = csp_buffer_get_always();
+	} else  {
+		/* The packet is not for us, it is ok to drop it if we don't have enough buffers*/
+		packet = csp_buffer_get(0);
+	}
+
+	if (packet == NULL) {
+		csp_print("RX %s: Failed to get csp_buffer(%zu)\n", iface->name, datalen);
+		return CSP_ERR_NOMEM;
+	}
+
+	csp_id_setup_rx(packet);
+	packet->id = csp_id;
+	memcpy(packet->frame_begin, rx_data, datalen);
+	packet->frame_length = datalen;
+	packet->length = packet->frame_length - csp_id_get_header_size();
+
+	csp_qfifo_write(packet, iface, NULL);
+	return CSP_ERR_NONE;
+}
+
+static int csp_zmqhub_close_msg(zmq_msg_t * msg, csp_iface_t * iface) {
+
+	int ret = zmq_msg_close(msg);
+	if (ret != 0) {
+		iface->rx_error++;
+		csp_print("ZMQ RX err %s: failed to close message: %s\n", iface->name, zmq_strerror(zmq_errno()));
+		return CSP_ERR_DRIVER;
+	}
+
+	return CSP_ERR_NONE;
+}
+
+static int csp_zmqhub_recv_msg(zmq_msg_t * msg, void * subscriber) {
+
+	int ret;
+	do {
+		ret = zmq_msg_recv(msg, subscriber, 0);
+	} while ((ret < 0) && (zmq_errno() == EINTR));
+	return ret;
+}
+
+static void csp_zmqhub_set_max_msg_size(void * subscriber) {
+
+	const int64_t max_msg_size = UINT16_MAX;
+	int __maybe_unused ret = zmq_setsockopt(subscriber, ZMQ_MAXMSGSIZE, &max_msg_size, sizeof(max_msg_size));
+	assert(ret == 0);
+}
+
+static int csp_zmqhub_drain_multipart(void * subscriber, csp_iface_t * iface) {
+
+	int more = 1;
+	while (more) {
+		zmq_msg_t part;
+		int ret = zmq_msg_init(&part);
+		if (ret != 0) {
+			iface->rx_error++;
+			return CSP_ERR_DRIVER;
+		}
+
+		ret = csp_zmqhub_recv_msg(&part, subscriber);
+		if (ret < 0) {
+			iface->rx_error++;
+			csp_print("ZMQ RX err %s: %s\n", iface->name, zmq_strerror(zmq_errno()));
+			csp_zmqhub_close_msg(&part, iface);
+			return CSP_ERR_DRIVER;
+		}
+
+		more = zmq_msg_more(&part);
+		ret = csp_zmqhub_close_msg(&part, iface);
+		if (ret != CSP_ERR_NONE) {
+			return CSP_ERR_DRIVER;
+		}
+	}
+
+	return CSP_ERR_NONE;
+}
+
+int csp_zmqhub_rx(void * subscriber, csp_iface_t * iface) {
+
+	zmq_msg_t msg;
+	int ret = zmq_msg_init(&msg);
+	if (ret != 0) {
+		iface->rx_error++;
+		return CSP_ERR_DRIVER;
+	}
+
+	ret = csp_zmqhub_recv_msg(&msg, subscriber);
+	if (ret < 0) {
+		iface->rx_error++;
+		csp_print("ZMQ RX err %s: %s\n", iface->name, zmq_strerror(zmq_errno()));
+		csp_zmqhub_close_msg(&msg, iface);
+		return CSP_ERR_DRIVER;
+	}
+
+	/* A CSP frame is carried in one single-part ZMQ message. */
+	if (zmq_msg_more(&msg)) {
+		iface->frame++;
+		csp_print("ZMQ RX %s: multipart messages are not supported\n", iface->name);
+		ret = csp_zmqhub_close_msg(&msg, iface);
+		if (ret != CSP_ERR_NONE) {
+			return CSP_ERR_DRIVER;
+		}
+		ret = csp_zmqhub_drain_multipart(subscriber, iface);
+		if (ret != CSP_ERR_NONE) {
+			return CSP_ERR_DRIVER;
+		}
+		return CSP_ERR_INVAL;
+	}
+
+	ret = csp_zmqhub_queue_msg(&msg, iface);
+	int close_ret = csp_zmqhub_close_msg(&msg, iface);
+	if (close_ret != CSP_ERR_NONE) {
+		return CSP_ERR_DRIVER;
+	}
+	return ret;
+}
+
+static void * csp_zmqhub_task(void * param) {
+
+	zmq_driver_t * drv = param;
+
+	while (1) {
+		int ret = csp_zmqhub_rx(drv->subscriber, &drv->iface);
+		if (ret == CSP_ERR_DRIVER) {
+			break;
+		}
+	}
+
+	return NULL;
+}
+
+int csp_zmqhub_make_endpoint(const char * host, uint16_t port, char * buf, size_t buf_size) {
+	int res = snprintf(buf, buf_size, "tcp://%s:%u", host, port);
+	if ((res < 0) || (res >= (int)buf_size)) {
+		buf[0] = 0;
+		return CSP_ERR_NOMEM;
+	}
+	return CSP_ERR_NONE;
+}
+
+int csp_zmqhub_init(uint16_t addr,
+					const char * host,
+					uint32_t flags,
+					csp_iface_t ** return_interface) {
+
+	char pub[100];
+	csp_zmqhub_make_endpoint(host, CSP_ZMQPROXY_SUBSCRIBE_PORT, pub, sizeof(pub));
+
+	char sub[100];
+	csp_zmqhub_make_endpoint(host, CSP_ZMQPROXY_PUBLISH_PORT, sub, sizeof(sub));
+
+	return csp_zmqhub_init_w_endpoints(addr, pub, sub, flags, return_interface);
+}
+
+int csp_zmqhub_init_w_endpoints(uint16_t addr,
+								const char * publisher_endpoint,
+								const char * subscriber_endpoint,
+								uint32_t flags,
+								csp_iface_t ** return_interface) {
+
+	uint16_t * rxfilter = NULL;
+	unsigned int rxfilter_count = 0;
+
+	return csp_zmqhub_init_w_name_endpoints_rxfilter(NULL, addr,
+													 rxfilter, rxfilter_count,
+													 publisher_endpoint,
+													 subscriber_endpoint,
+													 flags,
+													 return_interface);
+}
+
+int csp_zmqhub_init_w_name_endpoints_rxfilter(const char * ifname, uint16_t addr,
+											  const uint16_t __maybe_unused rxfilter[],
+											  unsigned int __maybe_unused rxfilter_count,
+											  const char * publish_endpoint,
+											  const char * subscribe_endpoint,
+											  uint32_t __maybe_unused flags,
+											  csp_iface_t ** return_interface) {
+
+	int __maybe_unused ret;
+	pthread_attr_t attributes;
+	zmq_driver_t * drv = calloc(1, sizeof(*drv));
+	assert(drv != NULL);
+
+	if (ifname == NULL) {
+		ifname = CSP_ZMQHUB_IF_NAME;
+	}
+
+	strncpy(drv->name, ifname, sizeof(drv->name) - 1);
+	drv->iface.name = drv->name;
+	drv->iface.driver_data = drv;
+	drv->iface.nexthop = csp_zmqhub_tx;
+	drv->iface.addr = addr;
+
+	drv->context = zmq_ctx_new();
+	assert(drv->context != NULL);
+
+	//csp_print("INIT %s: pub(tx): [%s], sub(rx): [%s], rx filters: %u", drv->iface.name, publish_endpoint, subscribe_endpoint, rxfilter_count);
+
+	/* Publisher (TX) */
+	drv->publisher = zmq_socket(drv->context, ZMQ_PUB);
+	assert(drv->publisher != NULL);
+
+	/* Subscriber (RX) */
+	drv->subscriber = zmq_socket(drv->context, ZMQ_SUB);
+	assert(drv->subscriber != NULL);
+	csp_zmqhub_set_max_msg_size(drv->subscriber);
+
+	// subscribe to all packets - no filter
+	ret = zmq_setsockopt(drv->subscriber, ZMQ_SUBSCRIBE, NULL, 0);
+	assert(ret == 0);
+
+	/* Connect to server */
+	ret = zmq_connect(drv->publisher, publish_endpoint);
+	assert(ret == 0);
+	zmq_connect(drv->subscriber, subscribe_endpoint);
+	assert(ret == 0);
+
+	/* Start RX thread */
+	ret = pthread_attr_init(&attributes);
+	assert(ret == 0);
+	ret = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+	assert(ret == 0);
+	ret = pthread_create(&drv->rx_thread, &attributes, csp_zmqhub_task, drv);
+	assert(ret == 0);
+	ret = pthread_attr_destroy(&attributes);
+	assert(ret == 0);
+	(void)ret;
+	/* Register interface */
+	csp_iflist_add(&drv->iface);
+
+	if (return_interface) {
+		*return_interface = &drv->iface;
+	}
+
+	return CSP_ERR_NONE;
+}
+
+int csp_zmqhub_remove_filters(csp_iface_t * zmq_iface) {
+
+	if(zmq_iface == NULL || zmq_iface->driver_data == NULL || zmq_iface->nexthop != csp_zmqhub_tx) {
+		return -1;
+	}
+
+	int ret = 0;
+	zmq_driver_t * drv = zmq_iface->driver_data;
+	const uint16_t addr = zmq_iface->addr;
+	const uint16_t hostmask = (1 << (csp_id_get_host_bits() - zmq_iface->netmask)) - 1;
+
+	/* Unsubscribe from any current filters */
+	for (int i = 0; i < 4; i++) {
+		//int i = CSP_PRIO_NORM;
+		drv->filt[i][0] = __builtin_bswap16((i << 14) | addr);
+		drv->filt[i][1] = __builtin_bswap16((i << 14) | addr | hostmask);
+		drv->filt[i][2] = __builtin_bswap16((i << 14) | 16383);
+		ret = zmq_setsockopt(drv->subscriber, ZMQ_UNSUBSCRIBE, &drv->filt[i][0], 2);
+		ret = zmq_setsockopt(drv->subscriber, ZMQ_UNSUBSCRIBE, &drv->filt[i][1], 2);
+		ret = zmq_setsockopt(drv->subscriber, ZMQ_UNSUBSCRIBE, &drv->filt[i][2], 2);
+	}
+
+	/* subscribe to all packets - no filter */
+	ret = zmq_setsockopt(drv->subscriber, ZMQ_SUBSCRIBE, NULL, 0);
+	assert(ret == 0);
+	return ret;
+}
+
+static int csp_zmqhub_add_filter(void * driver_data, uint16_t addr) {
+
+	int ret = 0;
+	zmq_driver_t * drv = (zmq_driver_t*)driver_data;
+
+	/* Subscribe to an extra address, typically registered by alias address */
+	for (int i = 0; i < 4; i++) {
+		uint16_t filter = __builtin_bswap16((i << 14) | addr);
+		ret = zmq_setsockopt(drv->subscriber, ZMQ_SUBSCRIBE, &filter, 2);
+		assert(ret == 0);
+	}
+	return ret;
+}
+
+int csp_zmqhub_add_filters(csp_iface_t * zmq_iface) {
+
+	if(zmq_iface == NULL || zmq_iface->driver_data == NULL || zmq_iface->nexthop != csp_zmqhub_tx) {
+		return -1;
+	}
+	int ret = 0;
+	zmq_driver_t * drv = zmq_iface->driver_data;
+	const uint16_t addr = zmq_iface->addr;
+	const uint16_t hostmask = (1 << (csp_id_get_host_bits() - zmq_iface->netmask)) - 1;
+
+	/* Unsubscribe to all packets */
+	ret = zmq_setsockopt(drv->subscriber, ZMQ_UNSUBSCRIBE, NULL, 0);
+	assert(ret == 0);
+
+	/* Subscribe to unpromiscuous filters */
+	for (int i = 0; i < 4; i++) {
+		//int i = CSP_PRIO_NORM;
+		drv->filt[i][0] = __builtin_bswap16((i << 14) | addr);
+		drv->filt[i][1] = __builtin_bswap16((i << 14) | addr | hostmask);
+		drv->filt[i][2] = __builtin_bswap16((i << 14) | 16383);
+		ret = zmq_setsockopt(drv->subscriber, ZMQ_SUBSCRIBE, &drv->filt[i][0], 2);
+		ret = zmq_setsockopt(drv->subscriber, ZMQ_SUBSCRIBE, &drv->filt[i][1], 2);
+		ret = zmq_setsockopt(drv->subscriber, ZMQ_SUBSCRIBE, &drv->filt[i][2], 2);
+	}
+	assert(ret == 0);
+	return ret;
+}
+
+int csp_zmqhub_init_filter2(const char * ifname, const char * host, uint16_t addr, uint16_t netmask, int promisc, csp_iface_t ** return_interface, char * sec_key, uint16_t subport, uint16_t pubport) {
+
+	/* ZMQ will cause valgrind errors if `sec_key` isn't exactly 40 characters long.
+		For now we deliberately parse an empty string as if no sec_key was specified. */
+	const ssize_t sec_key_len = sec_key ? strnlen(sec_key, CURVE_KEYLEN-1) : 0;
+	if (sec_key_len && sec_key_len != CURVE_KEYLEN-1) {
+		/* Is it bad to expose the detected length of the ZMQ key here? */
+		fprintf(stderr, "ZMQ secret key must be exactly 40 characters long (got %ld)\n", sec_key_len);
+		return CSP_ERR_INVAL;
+	}
+
+	char pub[100];
+	csp_zmqhub_make_endpoint(host, subport, pub, sizeof(pub));
+
+	char sub[100];
+	csp_zmqhub_make_endpoint(host, pubport, sub, sizeof(sub));
+
+	int __maybe_unused ret;
+	pthread_attr_t attributes;
+	zmq_driver_t * drv = calloc(1, sizeof(*drv));
+	assert(drv != NULL);
+
+	if (ifname == NULL) {
+		ifname = CSP_ZMQHUB_IF_NAME;
+	}
+
+	strncpy(drv->name, ifname, sizeof(drv->name) - 1);
+	drv->iface.name = drv->name;
+	drv->iface.driver_data = drv;
+	drv->iface.nexthop = csp_zmqhub_tx;
+	drv->iface.add_alias = csp_zmqhub_add_filter;
+
+	drv->iface.addr = addr;
+	drv->iface.netmask = netmask;
+
+	drv->context = zmq_ctx_new();
+	assert(drv->context != NULL);
+
+	csp_print("  ZMQ init %s: addr: %u, pub(tx): [%s], sub(rx): [%s]\n", drv->iface.name, addr, pub, sub);
+
+	/* Publisher (TX) */
+	drv->publisher = zmq_socket(drv->context, ZMQ_PUB);
+	assert(drv->publisher != NULL);
+
+	/* Subscriber (RX) */
+	drv->subscriber = zmq_socket(drv->context, ZMQ_SUB);
+	assert(drv->subscriber != NULL);
+	csp_zmqhub_set_max_msg_size(drv->subscriber);
+
+	/* If shared secret key provided */
+	if (sec_key_len) {
+		char pub_key[CURVE_KEYLEN];
+
+		zmq_curve_public(pub_key, sec_key);
+		/* Publisher (TX) */
+		zmq_setsockopt(drv->publisher, ZMQ_CURVE_SERVERKEY, pub_key, CURVE_KEYLEN);
+		zmq_setsockopt(drv->publisher, ZMQ_CURVE_PUBLICKEY, pub_key, CURVE_KEYLEN);
+		zmq_setsockopt(drv->publisher, ZMQ_CURVE_SECRETKEY, sec_key, CURVE_KEYLEN);
+		/* Subscriber (RX) */
+		zmq_setsockopt(drv->subscriber, ZMQ_CURVE_SERVERKEY, pub_key, CURVE_KEYLEN);
+		zmq_setsockopt(drv->subscriber, ZMQ_CURVE_PUBLICKEY, pub_key, CURVE_KEYLEN);
+		zmq_setsockopt(drv->subscriber, ZMQ_CURVE_SECRETKEY, sec_key, CURVE_KEYLEN);
+	}
+	int keep_alive = 1;
+	/* Time in seconds a connection must be idle before keep-alive packet send*/
+	int idle = 900;
+	/* Maximum number of keep-alive probes to send without ack before connection closed */
+	int cnt = 2;
+	/* Interval in seconds between each keep-alive probe */
+	int intvl = 900;
+	/* Publisher (TX) */
+	zmq_setsockopt(drv->publisher, ZMQ_TCP_KEEPALIVE, &keep_alive, sizeof(keep_alive));
+	zmq_setsockopt(drv->publisher, ZMQ_TCP_KEEPALIVE_IDLE, &idle, sizeof(idle));
+	zmq_setsockopt(drv->publisher, ZMQ_TCP_KEEPALIVE_CNT, &cnt, sizeof(cnt));
+	zmq_setsockopt(drv->publisher, ZMQ_TCP_KEEPALIVE_INTVL, &intvl, sizeof(intvl));
+	/* Subscriber (RX) */
+	zmq_setsockopt(drv->subscriber, ZMQ_TCP_KEEPALIVE, &keep_alive, sizeof(keep_alive));
+	zmq_setsockopt(drv->subscriber, ZMQ_TCP_KEEPALIVE_IDLE, &idle, sizeof(idle));
+	zmq_setsockopt(drv->subscriber, ZMQ_TCP_KEEPALIVE_CNT, &cnt, sizeof(cnt));
+	zmq_setsockopt(drv->subscriber, ZMQ_TCP_KEEPALIVE_INTVL, &intvl, sizeof(intvl));
+
+	/* Connect to server */
+	ret = zmq_connect(drv->publisher, pub);
+	assert(ret == 0);
+	ret = zmq_connect(drv->subscriber, sub);
+	assert(ret == 0);
+	(void)ret;
+
+	if (promisc) {
+		// subscribe to all packets - no filter
+		csp_zmqhub_remove_filters(&drv->iface);
+
+	} else {
+		csp_zmqhub_add_filters(&drv->iface);
+	}
+
+
+	/* Start RX thread */
+	ret = pthread_attr_init(&attributes);
+	assert(ret == 0);
+	ret = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+	assert(ret == 0);
+	ret = pthread_create(&drv->rx_thread, &attributes, csp_zmqhub_task, drv);
+	assert(ret == 0);
+	ret = pthread_attr_destroy(&attributes);
+	assert(ret == 0);
+
+	/* Register interface */
+	csp_iflist_add(&drv->iface);
+
+	if (return_interface) {
+		*return_interface = &drv->iface;
+	}
+
+	return CSP_ERR_NONE;
+}
+
+
+#endif  // CSP_HAVE_LIBZMQ

@@ -3,24 +3,28 @@
 #[cfg(test)]
 extern crate std;
 
-pub mod arch;
+mod arch;
 pub mod interfaces;
 
-mod bridge;
-
 // mod cmp;
+mod bridge;
 mod buffer;
 mod conn;
 mod crc32;
 mod dedup;
+pub mod drivers;
 mod id;
 mod io;
 mod port;
 mod promisc;
 mod qfifo;
+#[cfg(feature = "rdp")]
 mod rdp;
+#[cfg(feature = "rdp")]
 mod rdp_queue;
 mod route;
+
+pub use bridge::{bridge_set_interfaces, bridge_work};
 
 pub use buffer::Packet;
 
@@ -32,10 +36,11 @@ pub use interfaces::{
     Interface, InterfaceID, add_interface, print_interface_list, remove_interface,
 };
 
-pub async fn init() {
-    buffer::buffer_init().await;
+pub use route::route_work;
 
+pub async fn init() {
     qfifo::init();
+    #[cfg(feature = "rdp")]
     rdp_queue::init();
 
     /* Loopback */
@@ -47,12 +52,14 @@ pub async fn init() {
 pub enum Error {
     Timeout,
     CRC32,
+    HMAC,
     FeatureDisabled,
     ConnectionClosed,
     BufferOverflow,
     InvalidOperation,
     PortBusy,
     AllocError,
+    CanBusError,
 }
 
 const CSP_RTABLE_SIZE: usize = 10;
@@ -113,8 +120,8 @@ pub struct CspStream {
 
 impl Drop for CspStream {
     fn drop(&mut self) {
-        if self.conn.is_some() {
-            panic!("Stream must be closed before drop");
+        if let Some(conn) = &self.conn {
+            conn.close_nonblocking();
         }
     }
 }
@@ -154,10 +161,11 @@ impl CspStream {
     }
 
     /// Send packet on a connection.
-    /// This will fail if data is larger then 256 bytes or 252 bytes with CRC
+    /// This will fail if total data is larger then 256 bytes.
+    /// CRC32 costs 4 bytes and RDP header costs 5 bytes if enabled.
     pub async fn send(&mut self, data: &[u8]) -> Result<usize, Error> {
         if let Some(conn) = self.conn.as_mut() {
-            let packet = Packet::get().await;
+            let mut packet = Packet::get().ok_or(Error::AllocError)?;
             packet.append_data(data)?;
 
             io::send(conn, packet).await?;
@@ -173,16 +181,12 @@ impl CspStream {
             let packet = conn.read(timeout).await?;
 
             if packet.data_length() > data.len() {
-                packet.free().await;
                 return Err(Error::BufferOverflow);
             }
             // get packet size
             let len = packet.data_length();
             // copy data
             data[..len].copy_from_slice(packet.data());
-            // free packet
-            packet.free().await;
-
             return Ok(len);
         } else {
             return Err(Error::ConnectionClosed);
@@ -199,7 +203,7 @@ impl CspStream {
 
     /// This must be called before CspStream is dropped
     pub async fn close(&mut self) {
-        if let Some(conn) = self.conn.as_mut() {
+        if let Some(mut conn) = self.conn.take() {
             conn.close().await
         }
     }
@@ -242,7 +246,7 @@ impl CspListener {
         });
     }
 
-    pub async fn close(&mut self){
+    pub async fn close(&mut self) {
         self.sock.close().await
     }
 }

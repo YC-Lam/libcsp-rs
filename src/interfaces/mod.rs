@@ -1,7 +1,10 @@
+pub mod can;
 pub(crate) mod loopback;
 
 use core::any::Any;
+use core::future::poll_fn;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::task::{Context, Poll};
 
 use crate::{Error, Packet};
 
@@ -18,7 +21,7 @@ pub fn remove_interface(iface: InterfaceID) -> bool {
     INTERFACES.remove(iface)
 }
 
-pub fn get_interface_by_id(id: InterfaceID) -> Option<&'static mut dyn Interface> {
+pub(crate) fn get_interface_by_id(id: InterfaceID) -> Option<&'static mut dyn Interface> {
     // loop through interfaces
     for iface in &INTERFACES {
         if core::ptr::addr_eq(id.0 as *const InterfacePrivate, iface) {
@@ -29,7 +32,7 @@ pub fn get_interface_by_id(id: InterfaceID) -> Option<&'static mut dyn Interface
     return None;
 }
 
-pub fn get_interface_by_subnet(addr: u16) -> Option<&'static mut dyn Interface> {
+fn get_interface_by_subnet(addr: u16) -> Option<&'static mut dyn Interface> {
     // loop through interfaces
     for iface in &INTERFACES {
         // make sure netmask is not zero
@@ -43,7 +46,7 @@ pub fn get_interface_by_subnet(addr: u16) -> Option<&'static mut dyn Interface> 
     return None;
 }
 
-pub fn get_interface_by_isdfl() -> Option<&'static mut dyn Interface> {
+fn get_interface_by_isdfl() -> Option<&'static mut dyn Interface> {
     // loop through interfaces
     for iface in &INTERFACES {
         if iface.is_default() {
@@ -71,7 +74,7 @@ pub(crate) fn check_dfl() {
     }
 }
 
-pub fn get_interface_by_addr(addr: u16) -> Option<&'static mut dyn Interface> {
+pub(crate) fn get_interface_by_addr(addr: u16) -> Option<&'static mut dyn Interface> {
     for iface in &INTERFACES {
         if iface.addr() == addr {
             return Some(iface.inner());
@@ -81,7 +84,7 @@ pub fn get_interface_by_addr(addr: u16) -> Option<&'static mut dyn Interface> {
     return None;
 }
 
-pub fn get_interface_by_broadcast(addr: u16) -> Option<&'static mut dyn Interface> {
+fn get_interface_by_broadcast(addr: u16) -> Option<&'static mut dyn Interface> {
     for iface in &INTERFACES {
         if crate::id::is_broadcast(addr, iface.addr(), iface.netmask()) {
             return Some(iface.inner());
@@ -91,7 +94,7 @@ pub fn get_interface_by_broadcast(addr: u16) -> Option<&'static mut dyn Interfac
     return None;
 }
 
-pub fn get_interface_by_name(name: &str) -> Option<&'static mut dyn Interface> {
+fn get_interface_by_name(name: &str) -> Option<&'static mut dyn Interface> {
     for iface in &INTERFACES {
         if iface.name() == name {
             return Some(iface.inner());
@@ -101,7 +104,7 @@ pub fn get_interface_by_name(name: &str) -> Option<&'static mut dyn Interface> {
     return None;
 }
 
-pub fn get_interface_by_index(idx: usize) -> Option<&'static mut dyn Interface> {
+fn get_interface_by_index(idx: usize) -> Option<&'static mut dyn Interface> {
     for (i, iface) in INTERFACES.into_iter().enumerate() {
         if i == idx {
             return Some(iface.inner());
@@ -168,6 +171,8 @@ pub fn print_interface_list(writer: &mut impl core::fmt::Write) -> core::fmt::Re
 pub struct InterfaceID(usize);
 
 pub trait Interface: Send + Sync + Any {
+    fn start(&mut self, _id: InterfaceID) {}
+
     /// Host address on this subnet
     fn addr(&self) -> u16;
     /// Subnet mask
@@ -176,12 +181,47 @@ pub trait Interface: Send + Sync + Any {
     fn name(&self) -> &str;
     /// Next hop (Tx) function
     fn next_hop(&mut self, via: Option<u16>, packet: &Packet, from_me: bool) -> Result<(), Error>;
+    /// Poll an asynchronous next-hop operation.
+    fn poll_next_hop(
+        &mut self,
+        _cx: &mut Context<'_>,
+        via: Option<u16>,
+        packet: &Packet,
+        from_me: bool,
+        _state: &mut TxState,
+    ) -> Poll<Result<(), Error>> {
+        Poll::Ready(self.next_hop(via, packet, from_me))
+    }
+    /// Whether this packet should be delivered locally rather than transmitted.
+    fn is_loopback_destination(&self, _packet: &Packet) -> bool {
+        false
+    }
+    /// Process one received frame. Implementations return a packet only when it is complete.
+    #[doc(hidden)]
+    fn process_rx_frame(
+        &mut self,
+        _id: u32,
+        _data: &[u8],
+        _timestamp_rx: u32,
+    ) -> Result<Option<Packet>, Error> {
+        Err(Error::InvalidOperation)
+    }
     /// Add receive address to interface (could be multicast receptions)
     fn alias_add(&mut self, addr: u16) -> Result<(), Error>;
     /// Set default IF flag (CSP supports multiple defaults)
     fn is_default(&self) -> bool;
     /// private data for internal use only
     fn private(&mut self) -> &mut InterfacePrivate;
+}
+
+#[doc(hidden)]
+#[derive(Default)]
+pub struct TxState {
+    pub(crate) started: bool,
+    pub(crate) first_frame_sent: bool,
+    pub(crate) sender_count: u8,
+    pub(crate) fragment_count: u8,
+    pub(crate) tx_count: usize,
 }
 
 pub struct InterfacePrivate {
@@ -249,8 +289,12 @@ impl InterfacePrivate {
 
     /// binds the dyn Interface address for easy access.
     /// This must be called before any method call
-    fn bind(&mut self, iface: *mut dyn Interface) {
+    const fn bind(&mut self, iface: *mut dyn Interface) {
         self.iface = Some(iface)
+    }
+
+    pub(crate) fn id(&self) -> InterfaceID {
+        InterfaceID(self as *const Self as usize)
     }
 
     /// get the parent Interface reference.
@@ -298,12 +342,15 @@ impl InterfacePrivate {
         packet: &Packet,
         from_me: bool,
     ) -> Result<(), Error> {
-        let iface = self.inner() as &mut dyn Any;
-        if let Some(can_iface) = iface.downcast_mut::<()>() {
-            todo!()
-        } else {
-            self.inner().next_hop(via, packet, from_me)
+        if self.inner().is_loopback_destination(packet) {
+            let copy = packet.buffer_clone().ok_or(Error::AllocError)?;
+            crate::qfifo::write(copy, self.id()).await;
+            return Ok(());
         }
+
+        let iface = self.inner();
+        let mut state = TxState::default();
+        poll_fn(|cx| iface.poll_next_hop(cx, via, packet, from_me, &mut state)).await
     }
 }
 
@@ -354,7 +401,7 @@ impl IfList {
         new.removed.store(false, Ordering::Release);
 
         // loop until compare exchange success
-        loop {
+        let id = loop {
             let store = match self.last() {
                 Some(last_iface) => &last_iface.next,
                 None => &self.iface,
@@ -368,7 +415,12 @@ impl IfList {
             if re.is_ok() {
                 break InterfaceID(new as *mut InterfacePrivate as usize);
             }
-        }
+        };
+
+        // start interface
+        iface.start(id);
+
+        return id;
     }
 
     fn remove(&self, iface: InterfaceID) -> bool {

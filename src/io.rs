@@ -20,7 +20,7 @@ fn convert_broadcast(idout: &CspId, idout_copy: &mut CspId, snd_iface: &Interfac
 
 async fn send_packet(
     idout_copy: &mut CspId,
-    snd_pkt: &'static mut Packet,
+    snd_pkt: Packet,
     snd_iface: &mut InterfacePrivate,
     via: Option<u16>,
     from_me: bool,
@@ -35,7 +35,7 @@ async fn send_packet(
 
 pub(crate) async fn send_direct(
     idout: &CspId,
-    packet: &'static mut Packet,
+    packet: Packet,
     routed_from: Option<&InterfacePrivate>,
 ) -> Result<(), Error> {
     let from_me = routed_from.is_none();
@@ -65,12 +65,12 @@ pub(crate) async fn send_direct(
         }
 
         if let Some(next_iface) = next_iface {
-            let copy = packet.buffer_clone().await;
+            let copy = packet.buffer_clone().ok_or(Error::AllocError)?;
 
             convert_broadcast(idout, &mut idout_copy, next_iface);
             if let Err(e) = send_packet(&mut idout_copy, copy, next_iface, via, from_me).await {
                 // free packet before exit
-                packet.free().await;
+                drop(packet);
                 return Err(e);
             };
         }
@@ -82,7 +82,7 @@ pub(crate) async fn send_direct(
             convert_broadcast(idout, &mut idout_copy, next_iface);
             send_packet(&mut idout_copy, packet, next_iface, via, from_me).await?;
         } else {
-            packet.free().await;
+            drop(packet);
         }
         /* If a match was found, we don't want to look at the routing table */
         return Ok(());
@@ -137,11 +137,11 @@ pub(crate) async fn send_direct(
         }
 
         if let Some(next_iface) = next_iface {
-            let copy = packet.buffer_clone().await;
+            let copy = packet.buffer_clone().ok_or(Error::AllocError)?;
             // send packet to interface
             if let Err(e) = send_packet(&mut idout_copy, copy, next_iface, via, from_me).await {
                 // free packet before exit
-                packet.free().await;
+                drop(packet);
                 return Err(e);
             }
         }
@@ -153,14 +153,12 @@ pub(crate) async fn send_direct(
         return Ok(());
     }
 
-    packet.free().await;
-
     return Ok(());
 }
 
-async fn send_direct_iface(
+pub(crate) async fn send_direct_iface(
     idout: &CspId,
-    packet: &'static mut Packet,
+    mut packet: Packet,
     iface: &mut InterfacePrivate,
     via: Option<u16>,
     from_me: bool,
@@ -176,15 +174,10 @@ async fn send_direct_iface(
         if idout.flags.contains(Flags::CSP_FHMAC) {
             // Calculate and add HMAC (does not include header for backwards compatibility with csp1.x)
             #[cfg(feature = "hmac")]
-            //if (csp_hmac_append(packet, false) != CSP_ERR_NONE) {
-            /* HMAC append failed */
-            //    packet.free().await;
-            //    iface.tx_error +=1;
-            //}
             todo!();
 
             if !cfg!(feature = "hmac") {
-                packet.free().await;
+                drop(packet);
                 iface.tx_error += 1;
                 return Err(Error::FeatureDisabled);
             }
@@ -195,7 +188,7 @@ async fn send_direct_iface(
             /* Calculate and add CRC32 (does not include header for backwards compatibility with csp1.x) */
             if packet.append_crc32().is_err() {
                 /* CRC32 append failed */
-                packet.free().await;
+                drop(packet);
                 iface.tx_error += 1;
                 return Err(Error::CRC32);
             }
@@ -204,39 +197,33 @@ async fn send_direct_iface(
         // Loopback traffic is added to promisc queue by the router
         #[cfg(feature = "promisc")]
         if !iface.is_loop_back {
-            todo!() // csp_promisc_add(packet);
+            crate::promisc::add(&packet).await;
         }
     }
 
     /* Store length before passing to interface */
     let bytes = packet.data_length();
 
-    if let Err(e) = iface.next_hop(via, packet, from_me).await {
-        packet.free().await;
+    if let Err(e) = iface.next_hop(via, &packet, from_me).await {
         iface.tx_error += 1;
         return Err(e);
     }
 
-    // original libcsp does not free, but we do beacause iface does not take ownership
-    packet.free().await;
     iface.tx += 1;
     iface.txbytes += bytes as u32;
 
     return Ok(());
 }
 
-pub(crate) async fn send(conn: &mut Connection, packet: &'static mut Packet) -> Result<(), Error> {
+pub(crate) async fn send(conn: &mut Connection, mut packet: Packet) -> Result<(), Error> {
     // check if connection is closed
     if conn.is_closed() {
-        packet.free().await;
         return Err(Error::ConnectionClosed);
     }
 
     #[cfg(feature = "rdp")]
     if conn.idout().flags.contains(Flags::CSP_FRDP) {
-        let packet_ref = unsafe { (packet as *const Packet as *mut Packet).as_mut_unchecked() };
-        if let Err(e) = crate::rdp::send(conn, packet_ref).await {
-            packet.free().await;
+        if let Err(e) = crate::rdp::send(conn, &mut packet).await {
             return Err(e);
         }
     }
@@ -244,11 +231,7 @@ pub(crate) async fn send(conn: &mut Connection, packet: &'static mut Packet) -> 
     send_direct(conn.idout(), packet, None).await
 }
 
-async fn send_prio(
-    prio: Priority,
-    conn: &mut Connection,
-    packet: &'static mut Packet,
-) -> Result<(), Error> {
+async fn send_prio(prio: Priority, conn: &mut Connection, packet: Packet) -> Result<(), Error> {
     conn.set_idout_prio(prio);
     send(conn, packet).await
 }
@@ -263,7 +246,7 @@ async fn transaction_persistent(
     outbuf: &mut [u8],
 ) -> Result<usize, Error> {
     // allocate packet
-    let mut packet = Packet::get().await;
+    let mut packet = Packet::get().ok_or(Error::AllocError)?;
 
     // Copy the request
     packet.append_data(inbuf)?;
@@ -277,7 +260,6 @@ async fn transaction_persistent(
     packet = conn.read(timeout).await?;
 
     if packet.data_length() > outbuf.len() {
-        packet.free().await;
         return Err(Error::BufferOverflow);
     }
 
@@ -285,8 +267,6 @@ async fn transaction_persistent(
     outbuf[..packet.data_length()].copy_from_slice(packet.data());
 
     let length = packet.data_length();
-    packet.free().await;
-
     return Ok(length);
 }
 
@@ -317,7 +297,7 @@ async fn send_to(
     dport: u8,
     src_port: u8,
     opts: ConnOptions,
-    packet: &'static mut Packet,
+    mut packet: Packet,
 ) -> Result<(), Error> {
     // reset flags if not same
     if !opts.contains(ConnOptions::CSP_O_SAME) {
@@ -325,7 +305,6 @@ async fn send_to(
     }
 
     if opts.contains(ConnOptions::CSP_O_RDP) {
-        packet.free().await;
         return Err(Error::InvalidOperation);
     }
 
@@ -333,7 +312,6 @@ async fn send_to(
         if cfg!(feature = "hmac") {
             packet.id.flags |= Flags::CSP_FHMAC;
         } else {
-            packet.free().await;
             return Err(Error::FeatureDisabled);
         }
     }
@@ -353,8 +331,8 @@ async fn send_to(
 }
 
 async fn sendto_reply(
-    request_packet: &'static mut Packet,
-    reply_packet: &'static mut Packet,
+    request_packet: &Packet,
+    mut reply_packet: Packet,
     opts: ConnOptions,
 ) -> Result<(), Error> {
     // check same

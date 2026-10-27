@@ -1,4 +1,5 @@
 use core::ops::Deref;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use bitflags::bitflags;
 
@@ -12,49 +13,53 @@ const CSP_PORT_MAX_BIND: usize = get_max_port();
 /* We rely on the .bss section to clear this, so there is no csp_port_init() function */
 static mut PORTS: [Port; CSP_PORT_MAX_BIND + 2] = unsafe { core::mem::zeroed() };
 
+/// get callback handler for an incoming port
+pub(crate) fn get_callback(port: u8) -> Option<fn(Packet)> {
+    // check if valid port
+    if port as usize > CSP_PORT_MAX_BIND {
+        return None;
+    }
+
+    match unsafe { &PORTS[port as usize] } {
+        // Check if port is open callback
+        Port::OpenCallback(f) => Some(*f),
+        // If it's open socket, then return no callback
+        Port::Open(_) => None,
+        // Otherwise check if we have a match all callback
+        Port::Closed => match unsafe { &PORTS[CSP_PORT_MAX_BIND + 1] } {
+            Port::OpenCallback(f) => Some(*f),
+            _ => None,
+        },
+    }
+}
+
+/// get socket for an incoming port
+pub(crate) fn get_socket(port: u8) -> Option<*mut Socket> {
+    // check if valid port
+    if port as usize > CSP_PORT_MAX_BIND {
+        return None;
+    }
+
+    match unsafe { &PORTS[port as usize] } {
+        Port::Open(s) => Some(*s),
+        // Check if port is open callback
+        Port::OpenCallback(_) => None,
+        // Otherwise check if we have a match all callback
+        Port::Closed => match unsafe { &PORTS[CSP_PORT_MAX_BIND + 1] } {
+            Port::Open(s) => Some(*s),
+            _ => None,
+        },
+    }
+}
+
 #[repr(u8)]
 pub(crate) enum Port {
     Closed = 0,
     Open(*mut Socket),
-    OpenCallback(fn(&Packet)),
+    OpenCallback(fn(Packet)),
 }
 
 impl Port {
-    pub fn get_callback(port: u8) -> Option<fn(&Packet)> {
-        if port as usize > CSP_PORT_MAX_BIND {
-            return None;
-        }
-
-        match unsafe { &PORTS[port as usize] } {
-            // Check if port is open callback
-            Port::OpenCallback(f) => Some(*f),
-            // If it's open socket, then return no callback
-            Port::Open(_) => None,
-            // Otherwise check if we have a match all callback
-            Port::Closed => match unsafe { &PORTS[CSP_PORT_MAX_BIND + 1] } {
-                Port::OpenCallback(f) => Some(*f),
-                _ => None,
-            },
-        }
-    }
-
-    pub fn get_socket(port: u8) -> Option<*mut Socket> {
-        if port as usize > CSP_PORT_MAX_BIND {
-            return None;
-        }
-
-        match unsafe { &PORTS[port as usize] } {
-            Port::Open(s) => Some(*s),
-            // Check if port is open callback
-            Port::OpenCallback(_) => None,
-            // Otherwise check if we have a match all callback
-            Port::Closed => match unsafe { &PORTS[CSP_PORT_MAX_BIND + 1] } {
-                Port::Open(s) => Some(*s),
-                _ => None,
-            },
-        }
-    }
-
     pub fn is_open(&self) -> bool {
         match self {
             Self::Closed => false,
@@ -89,11 +94,12 @@ bitflags! {
 
 pub(crate) enum ConnOrPacket {
     Connection(Connection),
-    Packet(&'static mut Packet),
+    Packet(Packet),
 }
 
 pub(crate) struct Socket {
     pub(crate) rx_queue: Queue<ConnOrPacket, CSP_CONN_RXQUEUE_LEN>,
+    pub(crate) ready: AtomicBool,
     pub(crate) opts: SocketOptions,
 }
 
@@ -101,31 +107,32 @@ impl Socket {
     pub const fn new() -> Self {
         Self {
             rx_queue: Queue::new(),
+            ready: AtomicBool::new(false),
             opts: SocketOptions::empty(),
         }
     }
 
     pub async fn accept(&self, timeout: u32) -> Result<Connection, Error> {
         match self.rx_queue.pop_with_timeout(timeout).await {
-            Some(ConnOrPacket::Connection(conn)) => Ok(conn),
-            Some(ConnOrPacket::Packet(p)) => {
-                p.free().await;
+            Ok(ConnOrPacket::Connection(conn)) => Ok(conn),
+            Ok(ConnOrPacket::Packet(p)) => {
+                drop(p);
                 Err(Error::InvalidOperation)
             }
-            None => Err(Error::Timeout),
+            Err(_) => Err(Error::Timeout),
         }
     }
 
     ///  Read data from a connection-less server socket.
-    pub async fn recv_packet(&self, timeout: u32) -> Result<&'static Packet, Error> {
+    pub async fn recv_packet(&self, timeout: u32) -> Result<Packet, Error> {
         //
         if !self.opts.contains(SocketOptions::CSP_SO_CONN_LESS) {
             return Err(Error::InvalidOperation);
         }
 
         let next = match self.rx_queue.pop_with_timeout(timeout).await {
-            Some(ptr) => ptr,
-            None => return Err(Error::Timeout),
+            Ok(p) => p,
+            Err(_) => return Err(Error::Timeout),
         };
 
         match next {
@@ -137,11 +144,16 @@ impl Socket {
         }
     }
 
-    fn is_conn_less(&self) -> bool {
+    pub fn is_ready_to_recieve(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    pub fn is_conn_less(&self) -> bool {
         self.opts.contains(SocketOptions::CSP_SO_CONN_LESS)
     }
 
     pub fn listen(&self, _backlog: usize) -> Result<(), Error> {
+        self.ready.store(true, Ordering::Release);
         return Ok(());
     }
 
@@ -159,7 +171,7 @@ impl Socket {
         }
 
         if self.is_conn_less() {
-            // nothing to do
+            self.ready.store(true, Ordering::Release);
         }
 
         unsafe {
@@ -168,7 +180,7 @@ impl Socket {
 
         return Ok(());
     }
-    
+
     #[allow(static_mut_refs)]
     pub async fn close(&mut self) {
         for port in unsafe { &mut PORTS } {
@@ -182,10 +194,10 @@ impl Socket {
             }
         }
 
-        while let Some(next) = self.rx_queue.try_pop().await {
+        while let Some(next) = self.rx_queue.try_pop() {
             match next {
                 ConnOrPacket::Connection(mut c) => c.close().await,
-                ConnOrPacket::Packet(p) => p.free().await,
+                ConnOrPacket::Packet(p) => drop(p),
             }
         }
     }
