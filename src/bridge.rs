@@ -17,9 +17,8 @@ pub async fn bridge_work() {
         match (BIF_A, BIF_B) {
             (Some(a), Some(b)) => (a, b),
             _ => {
-                //csp_print(
-                //    "Bridge interfaces are not setup yet. Make sure to call csp_bridge_set_interfaces()\n",
-                //);
+                #[cfg(feature = "defmt")]
+                defmt::warn!("Bridge interfaces are not configured");
                 return;
             }
         }
@@ -30,8 +29,13 @@ pub async fn bridge_work() {
     };
 
     let mut packet = input.packet;
+    if let Some(iface) = crate::interfaces::get_interface_by_id(input.iface) {
+        crate::route::csp_input_hook(iface.private(), &packet);
+    }
+
     if crate::dedup::is_duplicate(&mut packet) {
-        // csp_print("Retrieved packet is a duplicate\n");
+        #[cfg(feature = "defmt")]
+        defmt::trace!("Bridge dropped duplicate packet");
         drop(packet);
         return;
     }

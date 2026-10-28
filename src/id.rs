@@ -142,10 +142,6 @@ pub const fn get_max_port() -> usize {
     (1 << CSP_ID2_PORT_SIZE) - 1
 }
 
-pub const fn get_header_size() -> usize {
-    CSP_ID2_HEADER_SIZE
-}
-
 pub fn is_broadcast(addr: u16, iface_addr: u16, iface_netmask: u16) -> bool {
     let hostmask: u16 = (1 << get_host_bits() as u16 - iface_netmask) - 1;
     let netmask: u16 = (1 << get_host_bits()) - 1 - hostmask;

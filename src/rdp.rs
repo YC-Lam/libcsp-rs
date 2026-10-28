@@ -7,7 +7,7 @@ use bitflags::bitflags;
 
 use crate::arch::Semaphore;
 use crate::conn::{Connection, ConnectionID};
-use crate::port::{ConnOrPacket, Socket};
+use crate::port::{ConnOrPacket, SocketState};
 use crate::rdp_queue;
 use crate::{Error, Packet, Priority};
 
@@ -158,6 +158,14 @@ fn seq_before(seq: u16, cmp: u16) -> bool {
 fn seq_after(seq: u16, cmp: u16) -> bool {
     seq_before(cmp, seq)
 }
+#[inline]
+fn seq_add(seq: u16, increment: u16) -> u16 {
+    seq.wrapping_add(increment)
+}
+#[inline]
+fn seq_sub(seq: u16, decrement: u16) -> u16 {
+    seq.wrapping_sub(decrement)
+}
 /// Return 1 if time is before cmp
 #[inline]
 fn time_before(time: u32, cmp: u32) -> bool {
@@ -167,6 +175,18 @@ fn time_before(time: u32, cmp: u32) -> bool {
 #[inline]
 fn time_after(time: u32, cmp: u32) -> bool {
     time_before(cmp, time)
+}
+#[inline]
+fn time_deadline(start: u32, timeout: u32) -> u32 {
+    start.wrapping_add(timeout)
+}
+
+#[inline]
+fn control_priority(priority: Priority) -> Priority {
+    match priority {
+        Priority::Critical => Priority::Critical,
+        _ => Priority::High,
+    }
 }
 
 /**
@@ -211,6 +231,15 @@ async fn send_cmp(
     header.flags |= RdpFlags::from_bits_retain(CSP_RDP_INCR.fetch_add(1, Ordering::Acquire) << 4);
     header.flags |= flags;
 
+    #[cfg(feature = "defmt")]
+    defmt::trace!(
+        "RDP control tx flags={=u8} seq={=u16} ack={=u16} len={=u16}",
+        header.flags.bits(),
+        seq_nr,
+        ack_nr,
+        packet.data_length() as u16
+    );
+
     /* Send copy to tx_queue, before sending packet to IF */
     if flags.contains(RdpFlags::RDP_SYN) {
         let Some(mut rdp_packet) = packet.buffer_clone() else {
@@ -221,12 +250,8 @@ async fn send_cmp(
     }
 
     /* Send control messages with high priority */
-    let idout = *conn.idout();
-
-    conn.set_idout_prio(match idout.prio {
-        Priority::Critical => Priority::Critical,
-        _ => Priority::High,
-    });
+    let mut idout = *conn.idout();
+    idout.prio = control_priority(idout.prio);
 
     /*csp_rdp_protocol("RDP %p: Send CMP S %u: syn %u, ack %u, eack %u, rst %u, seq_nr %5u, ack_nr %5u, packet_len %u (%u)\n",
                      (void *)conn, conn.rdp_connection().state,
@@ -274,7 +299,7 @@ async fn receive_data(conn: &mut Connection, mut packet: Packet) {
 async fn rx_queue_flush(conn: &mut Connection) {
     // Loop through RX queue
     'front: loop {
-        let next_seq_nr = conn.rdp_connection().rcv_cur + 1;
+        let next_seq_nr = seq_add(conn.rdp_connection().rcv_cur, 1);
 
         let filter = |packet: &Packet| {
             // reference header
@@ -284,9 +309,10 @@ async fn rx_queue_flush(conn: &mut Connection) {
         };
 
         if let Some(packet) = rdp_queue::rx_try_get_filtered(conn.connection_id(), filter).await {
-            // csp_rdp_protocol("RDP %p: Deliver seq %u\n", (void *)conn, header.seq_nr);
+            #[cfg(feature = "defmt")]
+            defmt::trace!("RDP deliver in-order seq={=u16}", next_seq_nr as u16);
             receive_data(conn, packet).await;
-            conn.rdp_connection_mut().rcv_cur += 1;
+            conn.rdp_connection_mut().rcv_cur = seq_add(conn.rdp_connection().rcv_cur, 1);
 
             // Loop from first element again
             continue 'front;
@@ -318,10 +344,12 @@ async fn seq_in_rx_queue(conn_id: ConnectionID, seq_nr: u16) -> bool {
 
 async fn rx_queue_add(conn_id: ConnectionID, packet: Packet, seq_nr: u16) -> Result<(), Error> {
     if seq_in_rx_queue(conn_id, seq_nr).await {
-        // csp_rdp_protocol("RDP %p: Already exists in RX queue %u\n", (void *)conn, seq_nr);
+        #[cfg(feature = "defmt")]
+        defmt::trace!("RDP duplicate queued seq={=u16}", seq_nr);
         return Err(Error::InvalidOperation);
     }
-    // csp_rdp_protocol("RDP %p: Add to RX queue %u\n", (void *) conn, seq_nr);
+    #[cfg(feature = "defmt")]
+    defmt::trace!("RDP queue out-of-order seq={=u16}", seq_nr);
     rdp_queue::rx_add(conn_id, packet).await;
     return Ok(());
 }
@@ -337,7 +365,10 @@ fn should_ack(conn: &mut Connection) -> bool {
     let time_now = crate::arch::get_ms();
     if time_after(
         time_now,
-        conn.rdp_connection().ack_timestamp + conn.rdp_connection().ack_timeout,
+        time_deadline(
+            conn.rdp_connection().ack_timestamp,
+            conn.rdp_connection().ack_timeout,
+        ),
     ) {
         return true;
     }
@@ -345,7 +376,10 @@ fn should_ack(conn: &mut Connection) -> bool {
     // ACK if number of unacknowledged packets is greater than delay count
     if seq_after(
         conn.rdp_connection().rcv_cur,
-        conn.rdp_connection().rcv_lsa + conn.rdp_connection().ack_delay_count as u16,
+        seq_add(
+            conn.rdp_connection().rcv_lsa,
+            conn.rdp_connection().ack_delay_count as u16,
+        ),
     ) {
         return true;
     }
@@ -375,7 +409,13 @@ fn is_conn_ready_for_tx(conn: &mut Connection) -> bool {
     // Check Tx window (messages waiting for acks)
     if seq_after(
         conn.rdp_connection().snd_nxt,
-        conn.rdp_connection().snd_una + conn.rdp_connection().window_size as u16 - 1,
+        seq_sub(
+            seq_add(
+                conn.rdp_connection().snd_una,
+                conn.rdp_connection().window_size as u16,
+            ),
+            1,
+        ),
     ) {
         return false;
     }
@@ -397,11 +437,16 @@ pub(crate) async fn check_timeouts(conn: &mut Connection) {
      */
     if !conn.socket_delivered() {
         // get deadline
-        let deadline = conn.timestamp() + conn.rdp_connection().conn_timeout;
+        let deadline = time_deadline(conn.timestamp(), conn.rdp_connection().conn_timeout);
 
         if time_after(time_now, deadline) {
-            //csp_rdp_error("RDP %p: Found a lost connection (now: %" PRIu32 ", ts: %" PRIu32 ", to: %" PRIu32 "), closing\n",
-            //			  (void *)conn, time_now, conn.timestamp, conn.rdp_connection().conn_timeout);
+            #[cfg(feature = "defmt")]
+            defmt::warn!(
+                "RDP pending connection timed out now={=u32} started={=u32} timeout={=u32}",
+                time_now,
+                conn.timestamp(),
+                conn.rdp_connection().conn_timeout
+            );
             conn.conn_close(
                 CSP_RDP_CLOSED_BY_USERSPACE
                     | CSP_RDP_CLOSED_BY_PROTOCOL
@@ -418,8 +463,10 @@ pub(crate) async fn check_timeouts(conn: &mut Connection) {
      */
     if conn.rdp_connection().state == RdpState::CloseWait {
         // get deadline
-        let deadline = conn.timestamp() + conn.rdp_connection().conn_timeout;
+        let deadline = time_deadline(conn.timestamp(), conn.rdp_connection().conn_timeout);
         if time_after(time_now, deadline) {
+            #[cfg(feature = "defmt")]
+            defmt::warn!("RDP CLOSE_WAIT timed out");
             conn.conn_close(CSP_RDP_CLOSED_BY_PROTOCOL | CSP_RDP_CLOSED_BY_TIMEOUT)
                 .await;
             return;
@@ -436,7 +483,7 @@ pub(crate) async fn check_timeouts(conn: &mut Connection) {
     let filter = |packet: &Packet| {
         let header = RdpHeader::from_packet(&packet);
         seq_before(u16::from_be(header.seq_nr), packet_seq)
-            || time_after(time_now, packet.timestamp_tx + packet_timeout)
+            || time_after(time_now, time_deadline(packet.timestamp_tx, packet_timeout))
     };
 
     while let Some(mut packet) = rdp_queue::tx_try_get_filtered(conn.connection_id(), filter).await
@@ -455,14 +502,14 @@ pub(crate) async fn check_timeouts(conn: &mut Connection) {
         /* Check timestamp and retransmit if needed */
         if time_after(
             time_now,
-            packet.timestamp_tx + conn.rdp_connection().packet_timeout,
+            time_deadline(packet.timestamp_tx, conn.rdp_connection().packet_timeout),
         ) {
             let Some(new_packet) = packet.buffer_clone() else {
                 rdp_queue::tx_add(conn.connection_id(), packet).await;
                 continue;
             };
-            //csp_rdp_protocol("RDP %p: TX Element timed out, retransmitting seq %u\n",
-            //                    (void *)conn, be16toh(header.seq_nr));
+            #[cfg(feature = "defmt")]
+            defmt::warn!("RDP retransmit seq={=u16}", u16::from_be(header.seq_nr));
 
             /* Update to latest outgoing ACK */
             header.ack_nr = conn.rdp_connection().rcv_cur.to_be();
@@ -480,7 +527,7 @@ pub(crate) async fn check_timeouts(conn: &mut Connection) {
 
     if conn.rdp_connection().state == RdpState::Open {
         // get deadline
-        let deadline = conn.timestamp() + conn.rdp_connection().conn_timeout;
+        let deadline = time_deadline(conn.timestamp(), conn.rdp_connection().conn_timeout);
         // close connection if timed out
         if time_after(time_now, deadline) {
             conn.conn_close(CSP_RDP_CLOSED_BY_PROTOCOL | CSP_RDP_CLOSED_BY_TIMEOUT)
@@ -511,7 +558,7 @@ fn rand_r(seed: &mut u32) -> u32 {
 
 pub(crate) async fn new_packet(
     conn: &mut Connection,
-    dest_sock: Option<&Socket>,
+    dest_sock: Option<&SocketState>,
     packet: Packet,
 ) -> bool {
     let mut close_connection = false;
@@ -520,8 +567,19 @@ pub(crate) async fn new_packet(
     let rx_header = RdpHeader::from_packet(&packet);
     rx_header.ack_nr = u16::from_be(rx_header.ack_nr);
     rx_header.seq_nr = u16::from_be(rx_header.seq_nr);
+    #[cfg(feature = "defmt")]
+    let (rx_flags, rx_seq, rx_ack) = (rx_header.flags.bits(), rx_header.seq_nr, rx_header.ack_nr);
 
     let mut closed_by = CSP_RDP_CLOSED_BY_PROTOCOL;
+
+    #[cfg(feature = "defmt")]
+    defmt::trace!(
+        "RDP rx flags={=u8} seq={=u16} ack={=u16} len={=u16}",
+        rx_flags,
+        rx_seq,
+        rx_ack,
+        packet.data_length() as u16
+    );
 
     //csp_rdp_protocol(
     //	"RDP %p: Received in S %u: syn %u, ack %u, eack %u, "
@@ -557,7 +615,7 @@ pub(crate) async fn new_packet(
     if rx_header.flags.contains(RdpFlags::RDP_RST) {
         if rx_header.flags.contains(RdpFlags::RDP_ACK) {
             /* Store current ack'ed sequence number */
-            conn.rdp_connection_mut().snd_una = rx_header.ack_nr + 1;
+            conn.rdp_connection_mut().snd_una = seq_add(rx_header.ack_nr, 1);
         }
 
         if conn.rdp_connection().state == RdpState::Closed {
@@ -577,7 +635,7 @@ pub(crate) async fn new_packet(
             return discard_close(conn, closed_by, packet, close_connection).await;
         }
 
-        if rx_header.seq_nr == conn.rdp_connection().rcv_cur + 1 {
+        if rx_header.seq_nr == seq_add(conn.rdp_connection().rcv_cur, 1) {
             // csp_rdp_protocol("RDP %p: Received RST in sequence, no more data incoming, reply with RST\n", (void *)conn);
             conn.rdp_connection_mut().state = RdpState::CloseWait;
             conn.set_timestamp(crate::arch::get_ms());
@@ -630,7 +688,7 @@ pub(crate) async fn new_packet(
             /* Setup TX seq. */
             let mut seed = crate::arch::get_ms();
             conn.rdp_connection_mut().snd_iss = rand_r(&mut seed) as u16;
-            conn.rdp_connection_mut().snd_nxt = conn.rdp_connection().snd_iss + 1;
+            conn.rdp_connection_mut().snd_nxt = seq_add(conn.rdp_connection().snd_iss, 1);
             conn.rdp_connection_mut().snd_una = conn.rdp_connection().snd_iss;
 
             /* Store RX seq. */
@@ -709,8 +767,8 @@ pub(crate) async fn new_packet(
             {
                 conn.rdp_connection_mut().rcv_cur = rx_header.seq_nr;
                 conn.rdp_connection_mut().rcv_irs = rx_header.seq_nr;
-                conn.rdp_connection_mut().rcv_lsa = rx_header.seq_nr - 1;
-                conn.rdp_connection_mut().snd_una = rx_header.ack_nr + 1;
+                conn.rdp_connection_mut().rcv_lsa = seq_sub(rx_header.seq_nr, 1);
+                conn.rdp_connection_mut().snd_una = seq_add(rx_header.ack_nr, 1);
                 conn.rdp_connection_mut().ack_timestamp = crate::arch::get_ms();
                 conn.rdp_connection_mut().state = RdpState::Open;
 
@@ -777,11 +835,28 @@ pub(crate) async fn new_packet(
             /* Check sequence number */
             if !seq_between(
                 rx_header.seq_nr,
-                conn.rdp_connection().rcv_cur + 1,
-                conn.rdp_connection().rcv_cur + (conn.rdp_connection().window_size * 2) as u16,
+                seq_add(conn.rdp_connection().rcv_cur, 1),
+                seq_add(
+                    conn.rdp_connection().rcv_cur,
+                    conn.rdp_connection().window_size.wrapping_mul(2) as u16,
+                ),
             ) {
-                //csp_rdp_protocol("RDP %p: Invalid sequence number! %u not between %u and %" PRIu32"\n",
-                //				 (void *)conn, rx_header.seq_nr, conn.rdp_connection().rcv_cur + 1U, conn.rdp_connection().rcv_cur + (conn.rdp_connection().window_size * 2U));
+                #[cfg(feature = "defmt")]
+                let (invalid_seq, expected_start, expected_end) = (
+                    rx_header.seq_nr,
+                    seq_add(conn.rdp_connection().rcv_cur, 1),
+                    seq_add(
+                        conn.rdp_connection().rcv_cur,
+                        conn.rdp_connection().window_size.wrapping_mul(2) as u16,
+                    ),
+                );
+                #[cfg(feature = "defmt")]
+                defmt::warn!(
+                    "RDP invalid seq={=u16} expected range={=u16}..={=u16}",
+                    invalid_seq,
+                    expected_start,
+                    expected_end
+                );
 
                 let seq_nr = conn.rdp_connection().snd_iss;
                 let ack_nr = conn.rdp_connection().rcv_irs;
@@ -804,11 +879,16 @@ pub(crate) async fn new_packet(
             /* Check ACK number */
             if !seq_between(
                 rx_header.ack_nr,
-                conn.rdp_connection().snd_una - 1 - (conn.rdp_connection().window_size * 2) as u16,
-                conn.rdp_connection().snd_nxt - 1,
+                seq_sub(
+                    seq_sub(conn.rdp_connection().snd_una, 1),
+                    conn.rdp_connection().window_size.wrapping_mul(2) as u16,
+                ),
+                seq_sub(conn.rdp_connection().snd_nxt, 1),
             ) {
-                //csp_rdp_error("RDP %p: Invalid ACK number! %u not between %" PRIu32 " and %u\n",
-                //			  (void *)conn, rx_header.ack_nr, conn.rdp_connection().snd_una - 1 - (conn.rdp_connection().window_size * 2), conn.rdp_connection().snd_nxt - 1);
+                #[cfg(feature = "defmt")]
+                let invalid_ack = rx_header.ack_nr;
+                #[cfg(feature = "defmt")]
+                defmt::warn!("RDP invalid ack={=u16}", invalid_ack);
 
                 return discard_open(packet, close_connection).await;
             }
@@ -816,11 +896,15 @@ pub(crate) async fn new_packet(
             /* Check SYN_RCVD ACK */
             if conn.rdp_connection().state == RdpState::SynRecv {
                 if rx_header.ack_nr != conn.rdp_connection().snd_iss {
-                    //csp_rdp_error("RDP %p: SYN-RCVD: Wrong ACK number\n", (void *)conn);
+                    #[cfg(feature = "defmt")]
+                    let invalid_ack = rx_header.ack_nr;
+                    #[cfg(feature = "defmt")]
+                    defmt::warn!("RDP handshake invalid ack={=u16}", invalid_ack);
 
                     return discard_close(conn, closed_by, packet, close_connection).await;
                 }
-                //csp_rdp_protocol("RDP %p: NC: Connection OPEN\n", (void *)conn);
+                #[cfg(feature = "defmt")]
+                defmt::info!("RDP connection established");
                 conn.rdp_connection_mut().state = RdpState::Open;
 
                 /* If a socket is set, this message is the first in a new connection
@@ -848,7 +932,7 @@ pub(crate) async fn new_packet(
             }
 
             /* Store current ack'ed sequence number */
-            conn.rdp_connection_mut().snd_una = rx_header.ack_nr + 1;
+            conn.rdp_connection_mut().snd_una = seq_add(rx_header.ack_nr, 1);
 
             /* We have an EACK */
             if rx_header.flags.contains(RdpFlags::RDP_EAK) {
@@ -862,7 +946,7 @@ pub(crate) async fn new_packet(
             }
 
             /* If message is not in sequence, store packet for next flush */
-            if rx_header.seq_nr != (conn.rdp_connection().rcv_cur + 1) {
+            if rx_header.seq_nr != seq_add(conn.rdp_connection().rcv_cur, 1) {
                 let seq_nr = rx_header.seq_nr;
                 if rx_queue_add(conn.connection_id(), packet, seq_nr)
                     .await
@@ -905,8 +989,11 @@ pub(crate) async fn new_packet(
             /* Check ACK number */
             if !seq_between(
                 rx_header.ack_nr,
-                conn.rdp_connection().snd_una - 1 - (conn.rdp_connection().window_size * 2) as u16,
-                conn.rdp_connection().snd_nxt - 1,
+                seq_sub(
+                    seq_sub(conn.rdp_connection().snd_una, 1),
+                    conn.rdp_connection().window_size.wrapping_mul(2) as u16,
+                ),
+                seq_sub(conn.rdp_connection().snd_nxt, 1),
             ) {
                 //csp_rdp_error("RDP %p: Invalid ACK number! %u not between %" PRIu32 " and %u\n",
                 //			  (void *)conn, rx_header.ack_nr, conn.rdp_connection().snd_una - 1 - (conn.rdp_connection().window_size * 2), conn.rdp_connection().snd_nxt - 1);
@@ -914,7 +1001,7 @@ pub(crate) async fn new_packet(
             }
 
             /* Store current ack'ed sequence number */
-            conn.rdp_connection_mut().snd_una = rx_header.ack_nr + 1;
+            conn.rdp_connection_mut().snd_una = seq_add(rx_header.ack_nr, 1);
 
             let seq_nr = conn.rdp_connection().snd_nxt;
             let ack_nr = conn.rdp_connection().rcv_cur;
@@ -946,20 +1033,20 @@ pub(crate) async fn connect(conn: &mut Connection) -> Result<(), Error> {
     conn.rdp_connection_mut().ack_timestamp = crate::arch::get_ms();
 
     loop {
-        // csp_rdp_protocol("RDP %p: Active connect, conn state %u\n", (void *)conn, conn.rdp_connection().state);
-
         if conn.rdp_connection().state == RdpState::Open {
-            // csp_rdp_error("RDP %p: Connection already open\n", (void *)conn);
+            #[cfg(feature = "defmt")]
+            defmt::warn!("RDP connect requested for already-open connection");
             return Err(Error::InvalidOperation);
         }
 
         /* Randomize ISS */
         let mut seed = crate::arch::get_ms();
         conn.rdp_connection_mut().snd_iss = rand_r(&mut seed) as u16;
-        conn.rdp_connection_mut().snd_nxt = conn.rdp_connection().snd_iss + 1;
+        conn.rdp_connection_mut().snd_nxt = seq_add(conn.rdp_connection().snd_iss, 1);
         conn.rdp_connection_mut().snd_una = conn.rdp_connection().snd_iss;
 
-        // csp_rdp_protocol("RDP %p: AC: Sending SYN\n", (void *)conn);
+        #[cfg(feature = "defmt")]
+        defmt::debug!("RDP sending SYN");
 
         /* Ensure semaphore is busy, so router task can release it */
         let _ = conn.rdp_connection().tx_wait.wait(0).await;
@@ -967,8 +1054,9 @@ pub(crate) async fn connect(conn: &mut Connection) -> Result<(), Error> {
         /* Send SYN message */
         conn.rdp_connection_mut().state = RdpState::SynSent;
 
-        if let Err(_) = send_syn(conn).await {
-            break;
+        if let Err(error) = send_syn(conn).await {
+            let _ = close_internal(conn, CSP_RDP_CLOSED_BY_PROTOCOL, false).await;
+            return Err(error);
         }
 
         /* Wait for router task to release semaphore */
@@ -979,30 +1067,35 @@ pub(crate) async fn connect(conn: &mut Connection) -> Result<(), Error> {
 
         if result.is_ok() {
             if conn.rdp_connection().state == RdpState::Open {
-                // csp_rdp_protocol("RDP %p: AC: Connection OPEN\n", (void *)conn);
+                #[cfg(feature = "defmt")]
+                defmt::info!("RDP active connection established");
                 return Ok(());
             }
             if conn.rdp_connection().state == RdpState::SynSent {
                 if retry > 0 {
-                    // csp_rdp_error("RDP %p: Half-open connection detected, RST sent, now retrying\n", (void *)conn);
+                    #[cfg(feature = "defmt")]
+                    defmt::warn!("RDP half-open connection; retrying handshake");
                     rdp_queue::flush(Some(conn.connection_id())).await;
 
                     retry = 0;
                     continue;
                 }
-                // csp_rdp_error("RDP %p: Connection stayed half-open, even after RST and retry!\n", (void *)conn);
+                #[cfg(feature = "defmt")]
+                defmt::error!("RDP connection remained half-open after retry");
                 break;
             }
         }
     }
 
-    // csp_rdp_protocol("RDP %p: AC: Connection Failed\n", (void *)conn);
+    #[cfg(feature = "defmt")]
+    defmt::error!("RDP active connection failed");
     return close_internal(conn, CSP_RDP_CLOSED_BY_PROTOCOL, false).await;
 }
 
 pub(crate) async fn send(conn: &mut Connection, packet: &mut Packet) -> Result<(), Error> {
     if conn.rdp_connection().state != RdpState::Open {
-        // csp_rdp_error("RDP %p: ERROR cannot send, connection not open (%d)\n", (void *)conn, conn.rdp_connection().state);
+        #[cfg(feature = "defmt")]
+        defmt::warn!("RDP send rejected: connection is not open");
         return Err(Error::ConnectionClosed);
     }
 
@@ -1011,7 +1104,8 @@ pub(crate) async fn send(conn: &mut Connection, packet: &mut Packet) -> Result<(
         if conn.rdp_connection().state == RdpState::CloseWait
             || conn.rdp_connection().state == RdpState::Closed
         {
-            // csp_rdp_error("RDP %p: ERROR cannot send, connection closed by peer or timeout\n", (void *)conn);
+            #[cfg(feature = "defmt")]
+            defmt::warn!("RDP send rejected: connection closed or timed out");
             return Err(Error::ConnectionClosed);
         }
         if is_conn_ready_for_tx(conn) {
@@ -1024,11 +1118,15 @@ pub(crate) async fn send(conn: &mut Connection, packet: &mut Packet) -> Result<(
         let _ = conn.rdp_connection().tx_wait.wait(timeout).await;
     }
 
+    #[cfg(feature = "defmt")]
+    let payload_len = packet.data_length() as u16;
+
     /* Add RDP header */
     let tx_header = match RdpHeader::add(packet) {
         Ok(h) => h,
         Err(e) => {
-            // csp_rdp_error("RDP %p: No space for RDP header (send)\n", (void *)conn);
+            #[cfg(feature = "defmt")]
+            defmt::error!("RDP send failed: no room for header");
             return Err(e);
         }
     };
@@ -1036,6 +1134,20 @@ pub(crate) async fn send(conn: &mut Connection, packet: &mut Packet) -> Result<(
     tx_header.ack_nr = conn.rdp_connection().rcv_cur.to_be();
     tx_header.seq_nr = conn.rdp_connection().snd_nxt.to_be();
     tx_header.flags |= RdpFlags::RDP_ACK;
+
+    #[cfg(feature = "defmt")]
+    {
+        let flags = tx_header.flags.bits();
+        let seq = conn.rdp_connection().snd_nxt;
+        let ack = conn.rdp_connection().rcv_cur;
+        defmt::trace!(
+            "RDP data tx flags={=u8} seq={=u16} ack={=u16} len={=u16}",
+            flags,
+            seq,
+            ack,
+            payload_len + CSP_RDP_HEADER_SIZE as u16
+        );
+    }
 
     /* Send copy to tx_queue */
     let mut rdp_packet = packet.buffer_clone().ok_or(Error::AllocError)?;
@@ -1052,7 +1164,7 @@ pub(crate) async fn send(conn: &mut Connection, packet: &mut Packet) -> Result<(
     //	be16toh(tx_header.seq_nr), be16toh(tx_header.ack_nr),
     //	packet.length, (unsigned int)(packet.length - sizeof(rdp_header_t)));
 
-    conn.rdp_connection_mut().snd_nxt += 1;
+    conn.rdp_connection_mut().snd_nxt = seq_add(conn.rdp_connection().snd_nxt, 1);
     conn.rdp_connection_mut().ack_timestamp = crate::arch::get_ms();
     return Ok(());
 }
@@ -1091,20 +1203,26 @@ async fn close_internal(conn: &mut Connection, closed_by: u8, send_rst: bool) ->
             )
             .await;
         }
-        // csp_rdp_protocol("RDP %p: csp_rdp_close(0x%x)%s -> CLOSE_WAIT\n", (void *)conn, closed_by, send_rst ? ", sent RST" : "");
+        #[cfg(feature = "defmt")]
+        defmt::debug!(
+            "RDP entering CLOSE_WAIT closed_by={=u8} send_rst={=bool}",
+            closed_by,
+            send_rst
+        );
         conn.rdp_connection().tx_wait.post(); // wake up any pendng Tx
     }
 
     if conn.rdp_connection().closed_by != CSP_RDP_CLOSED_BY_ALL {
-        //csp_rdp_protocol("RDP %p: csp_rdp_close(0x%x) != %x, waiting for:%s%s%s\n",
-        //				 (void *)conn, closed_by, conn.rdp_connection().closed_by,
-        //				 (conn.rdp_connection().closed_by & CSP_RDP_CLOSED_BY_USERSPACE) ? "" : " userspace",
-        //				 (conn.rdp_connection().closed_by & CSP_RDP_CLOSED_BY_PROTOCOL) ? "" : " protocol",
-        //				 (conn.rdp_connection().closed_by & CSP_RDP_CLOSED_BY_TIMEOUT) ? "" : " timeout");
+        #[cfg(feature = "defmt")]
+        defmt::trace!(
+            "RDP close deferred closed_by={=u8}",
+            conn.rdp_connection().closed_by
+        );
         return Err(Error::InvalidOperation);
     }
 
-    // csp_rdp_protocol("RDP %p: csp_rdp_close(0x%x) -> CLOSED\n", (void *)conn, closed_by);
+    #[cfg(feature = "defmt")]
+    defmt::debug!("RDP connection closed");
     conn.rdp_connection_mut().state = RdpState::Closed;
     conn.rdp_connection_mut().closed_by = 0;
     return Ok(());
@@ -1151,7 +1269,7 @@ pub(crate) fn conn_is_active(conn: &Connection) -> bool {
     let time_now = crate::arch::get_ms();
     let mut active = true;
 
-    let deadline = conn.timestamp() + conn.rdp_connection().conn_timeout;
+    let deadline = time_deadline(conn.timestamp(), conn.rdp_connection().conn_timeout);
     if time_after(time_now, deadline) {
         /* The RDP connection has timed out */
         // csp_rdp_error("RDP %p: Timeout no packets received last %u ms\n", (void *)conn, conn.rdp_connection().conn_timeout);
@@ -1165,4 +1283,75 @@ pub(crate) fn conn_is_active(conn: &Connection) -> bool {
     }
 
     return active;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_starts_closed_with_protocol_timeouts() {
+        let connection = RdpConnection::const_new();
+
+        assert_eq!(connection.state, RdpState::Closed);
+        assert_eq!(connection.closed_by, 0);
+        assert_eq!(connection.window_size, 0);
+        assert_eq!(connection.conn_timeout, CSP_RDP_CONN_TIMEOUT);
+        assert_eq!(connection.packet_timeout, CSP_RDP_PACKET_TIMEOUT);
+        assert_eq!(connection.delayed_acks, 0);
+    }
+
+    #[test]
+    fn sequence_comparisons_handle_wraparound() {
+        assert!(seq_before(u16::MAX, 0));
+        assert!(seq_after(0, u16::MAX));
+        assert!(seq_between(0, u16::MAX, 1));
+        assert!(seq_between(1, u16::MAX, 1));
+        assert!(!seq_between(2, u16::MAX, 1));
+        assert!(!seq_before(5, 5));
+        assert!(!seq_after(5, 5));
+    }
+
+    #[test]
+    fn sequence_arithmetic_wraps_like_c_unsigned_values() {
+        assert_eq!(seq_add(u16::MAX, 1), 0);
+        assert_eq!(seq_sub(0, 1), u16::MAX);
+        assert_eq!(seq_sub(seq_add(u16::MAX, 1), 1), u16::MAX);
+    }
+
+    #[test]
+    fn timestamp_comparisons_handle_wraparound() {
+        assert!(time_before(u32::MAX, 0));
+        assert!(time_after(0, u32::MAX));
+        assert!(!time_before(5, 5));
+        assert!(!time_after(5, 5));
+        assert_eq!(time_deadline(u32::MAX, 1), 0);
+    }
+
+    #[test]
+    fn control_packets_raise_priority_without_exceeding_critical() {
+        assert_eq!(control_priority(Priority::Critical), Priority::Critical);
+        assert_eq!(control_priority(Priority::High), Priority::High);
+        assert_eq!(control_priority(Priority::Normal), Priority::High);
+        assert_eq!(control_priority(Priority::Low), Priority::High);
+    }
+
+    #[test]
+    fn rdp_header_round_trips_around_payload() {
+        let mut packet = Packet::get().unwrap();
+        packet.append_data(b"payload").unwrap();
+
+        let header = RdpHeader::add(&mut packet).unwrap();
+        header.flags = RdpFlags::RDP_ACK;
+        header.seq_nr = 0x1234u16.to_be();
+        header.ack_nr = 0x5678u16.to_be();
+
+        let header = RdpHeader::from_packet(&packet);
+        assert_eq!(header.flags, RdpFlags::RDP_ACK);
+        assert_eq!(u16::from_be(header.seq_nr), 0x1234);
+        assert_eq!(u16::from_be(header.ack_nr), 0x5678);
+
+        RdpHeader::remove(&mut packet);
+        assert_eq!(packet.data(), b"payload");
+    }
 }

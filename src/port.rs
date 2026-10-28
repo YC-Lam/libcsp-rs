@@ -1,5 +1,4 @@
-use core::ops::Deref;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use bitflags::bitflags;
 
@@ -12,6 +11,17 @@ const CSP_PORT_MAX_BIND: usize = get_max_port();
 
 /* We rely on the .bss section to clear this, so there is no csp_port_init() function */
 static mut PORTS: [Port; CSP_PORT_MAX_BIND + 2] = unsafe { core::mem::zeroed() };
+// Port entries point here so registrations remain valid when public handles move.
+static mut SOCKETS: [SocketState; CSP_PORT_MAX_BIND + 2] =
+    [const { SocketState::new() }; CSP_PORT_MAX_BIND + 2];
+
+fn socket_state(index: usize) -> &'static SocketState {
+    unsafe {
+        &*core::ptr::addr_of!(SOCKETS)
+            .cast::<SocketState>()
+            .add(index)
+    }
+}
 
 /// get callback handler for an incoming port
 pub(crate) fn get_callback(port: u8) -> Option<fn(Packet)> {
@@ -34,19 +44,19 @@ pub(crate) fn get_callback(port: u8) -> Option<fn(Packet)> {
 }
 
 /// get socket for an incoming port
-pub(crate) fn get_socket(port: u8) -> Option<*mut Socket> {
+pub(crate) fn get_socket(port: u8) -> Option<&'static SocketState> {
     // check if valid port
     if port as usize > CSP_PORT_MAX_BIND {
         return None;
     }
 
     match unsafe { &PORTS[port as usize] } {
-        Port::Open(s) => Some(*s),
+        Port::Open(index) => Some(socket_state(*index)),
         // Check if port is open callback
         Port::OpenCallback(_) => None,
         // Otherwise check if we have a match all callback
         Port::Closed => match unsafe { &PORTS[CSP_PORT_MAX_BIND + 1] } {
-            Port::Open(s) => Some(*s),
+            Port::Open(index) => Some(socket_state(*index)),
             _ => None,
         },
     }
@@ -55,7 +65,7 @@ pub(crate) fn get_socket(port: u8) -> Option<*mut Socket> {
 #[repr(u8)]
 pub(crate) enum Port {
     Closed = 0,
-    Open(*mut Socket),
+    Open(usize),
     OpenCallback(fn(Packet)),
 }
 
@@ -97,23 +107,60 @@ pub(crate) enum ConnOrPacket {
     Packet(Packet),
 }
 
-pub(crate) struct Socket {
+pub(crate) struct SocketState {
     pub(crate) rx_queue: Queue<ConnOrPacket, CSP_CONN_RXQUEUE_LEN>,
     pub(crate) ready: AtomicBool,
-    pub(crate) opts: SocketOptions,
+    opts: AtomicU32,
+}
+
+impl SocketState {
+    pub const fn new() -> Self {
+        Self {
+            rx_queue: Queue::new(),
+            ready: AtomicBool::new(false),
+            opts: AtomicU32::new(0),
+        }
+    }
+
+    pub(crate) fn options(&self) -> SocketOptions {
+        SocketOptions::from_bits_retain(self.opts.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn is_conn_less(&self) -> bool {
+        self.options().contains(SocketOptions::CSP_SO_CONN_LESS)
+    }
+
+    pub(crate) fn is_ready_to_recieve(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) struct Socket {
+    opts: SocketOptions,
+    slot: Option<usize>,
 }
 
 impl Socket {
     pub const fn new() -> Self {
         Self {
-            rx_queue: Queue::new(),
-            ready: AtomicBool::new(false),
             opts: SocketOptions::empty(),
+            slot: None,
         }
     }
 
+    pub const fn new_connectionless() -> Self {
+        Self {
+            opts: SocketOptions::CSP_SO_CONN_LESS,
+            slot: None,
+        }
+    }
+
+    fn state(&self) -> Result<&'static SocketState, Error> {
+        self.slot.map(socket_state).ok_or(Error::ConnectionClosed)
+    }
+
     pub async fn accept(&self, timeout: u32) -> Result<Connection, Error> {
-        match self.rx_queue.pop_with_timeout(timeout).await {
+        match self.state()?.rx_queue.pop_with_timeout(timeout).await {
             Ok(ConnOrPacket::Connection(conn)) => Ok(conn),
             Ok(ConnOrPacket::Packet(p)) => {
                 drop(p);
@@ -126,11 +173,12 @@ impl Socket {
     ///  Read data from a connection-less server socket.
     pub async fn recv_packet(&self, timeout: u32) -> Result<Packet, Error> {
         //
-        if !self.opts.contains(SocketOptions::CSP_SO_CONN_LESS) {
+        let state = self.state()?;
+        if !state.is_conn_less() {
             return Err(Error::InvalidOperation);
         }
 
-        let next = match self.rx_queue.pop_with_timeout(timeout).await {
+        let next = match state.rx_queue.pop_with_timeout(timeout).await {
             Ok(p) => p,
             Err(_) => return Err(Error::Timeout),
         };
@@ -144,16 +192,12 @@ impl Socket {
         }
     }
 
-    pub fn is_ready_to_recieve(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
-    }
-
     pub fn is_conn_less(&self) -> bool {
         self.opts.contains(SocketOptions::CSP_SO_CONN_LESS)
     }
 
     pub fn listen(&self, _backlog: usize) -> Result<(), Error> {
-        self.ready.store(true, Ordering::Release);
+        self.state()?.ready.store(true, Ordering::Release);
         return Ok(());
     }
 
@@ -170,31 +214,31 @@ impl Socket {
             return Err(Error::PortBusy);
         }
 
-        if self.is_conn_less() {
-            self.ready.store(true, Ordering::Release);
-        }
-
+        let state = socket_state(port);
+        state.opts.store(self.opts.bits(), Ordering::Release);
+        state.ready.store(self.is_conn_less(), Ordering::Release);
         unsafe {
-            PORTS[port] = Port::Open(self as *mut Socket);
+            PORTS[port] = Port::Open(port);
         }
+        self.slot = Some(port);
 
         return Ok(());
     }
 
-    #[allow(static_mut_refs)]
     pub async fn close(&mut self) {
-        for port in unsafe { &mut PORTS } {
-            match port {
-                Port::Open(s) => {
-                    if core::ptr::eq(*s, self.deref()) {
-                        *port = Port::Closed
-                    }
-                }
-                _ => {}
+        let Some(slot) = self.slot.take() else {
+            return;
+        };
+        unsafe {
+            if matches!(PORTS[slot], Port::Open(index) if index == slot) {
+                PORTS[slot] = Port::Closed;
             }
         }
 
-        while let Some(next) = self.rx_queue.try_pop() {
+        let state = socket_state(slot);
+        state.ready.store(false, Ordering::Release);
+        state.opts.store(0, Ordering::Release);
+        while let Some(next) = state.rx_queue.try_pop() {
             match next {
                 ConnOrPacket::Connection(mut c) => c.close().await,
                 ConnOrPacket::Packet(p) => drop(p),

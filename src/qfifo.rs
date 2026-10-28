@@ -17,9 +17,6 @@ pub(crate) struct Qfifo {
     pub(crate) iface: InterfaceID,
     pub(crate) packet: Packet,
 }
-pub(crate) fn init() {
-    // nothing to do
-}
 
 pub(crate) async fn read() -> Option<Qfifo> {
     QFIFO_QUEUE.pop_with_timeout(FIFO_TIMEOUT).await.ok()

@@ -1,14 +1,26 @@
 pub mod can;
+pub mod i2c;
 pub(crate) mod loopback;
+#[cfg(feature = "zmq")]
+pub mod zmq;
 
 use core::any::Any;
 use core::future::poll_fn;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use core::task::{Context, Poll};
 
+use crate::arch::LazyLock;
 use crate::{Error, Packet};
 
-pub(crate) static INTERFACES: IfList = IfList::new();
+static mut LOOPBACK: loopback::Loopback = loopback::Loopback::new();
+
+fn init_interfaces() -> IfList {
+    // The loopback instance is static and remains valid for the lifetime of the interface list.
+    let loopback = unsafe { &mut *core::ptr::addr_of_mut!(LOOPBACK) };
+    IfList::new(loopback)
+}
+
+pub(crate) static INTERFACES: LazyLock<IfList, fn() -> IfList> = LazyLock::new(init_interfaces);
 
 /// Add interface to interface list
 ///
@@ -23,7 +35,7 @@ pub fn remove_interface(iface: InterfaceID) -> bool {
 
 pub(crate) fn get_interface_by_id(id: InterfaceID) -> Option<&'static mut dyn Interface> {
     // loop through interfaces
-    for iface in &INTERFACES {
+    for iface in INTERFACES.get_or_init() {
         if core::ptr::addr_eq(id.0 as *const InterfacePrivate, iface) {
             return Some(iface.inner());
         }
@@ -34,7 +46,7 @@ pub(crate) fn get_interface_by_id(id: InterfaceID) -> Option<&'static mut dyn In
 
 fn get_interface_by_subnet(addr: u16) -> Option<&'static mut dyn Interface> {
     // loop through interfaces
-    for iface in &INTERFACES {
+    for iface in INTERFACES.get_or_init() {
         // make sure netmask is not zero
         if iface.netmask() != 0 {
             if iface.is_within_subnet(addr) {
@@ -48,7 +60,7 @@ fn get_interface_by_subnet(addr: u16) -> Option<&'static mut dyn Interface> {
 
 fn get_interface_by_isdfl() -> Option<&'static mut dyn Interface> {
     // loop through interfaces
-    for iface in &INTERFACES {
+    for iface in INTERFACES.get_or_init() {
         if iface.is_default() {
             return Some(iface.inner());
         }
@@ -65,7 +77,7 @@ pub(crate) fn check_dfl() {
     }
     // If there was not found a default interface,
     // go through all interfaces and set them as default (except for LOOP)
-    for iface in &INTERFACES {
+    for iface in INTERFACES.get_or_init() {
         if iface.is_loop_back {
             continue;
         }
@@ -75,7 +87,7 @@ pub(crate) fn check_dfl() {
 }
 
 pub(crate) fn get_interface_by_addr(addr: u16) -> Option<&'static mut dyn Interface> {
-    for iface in &INTERFACES {
+    for iface in INTERFACES.get_or_init() {
         if iface.addr() == addr {
             return Some(iface.inner());
         }
@@ -85,7 +97,7 @@ pub(crate) fn get_interface_by_addr(addr: u16) -> Option<&'static mut dyn Interf
 }
 
 fn get_interface_by_broadcast(addr: u16) -> Option<&'static mut dyn Interface> {
-    for iface in &INTERFACES {
+    for iface in INTERFACES.get_or_init() {
         if crate::id::is_broadcast(addr, iface.addr(), iface.netmask()) {
             return Some(iface.inner());
         }
@@ -95,7 +107,7 @@ fn get_interface_by_broadcast(addr: u16) -> Option<&'static mut dyn Interface> {
 }
 
 fn get_interface_by_name(name: &str) -> Option<&'static mut dyn Interface> {
-    for iface in &INTERFACES {
+    for iface in INTERFACES.get_or_init() {
         if iface.name() == name {
             return Some(iface.inner());
         }
@@ -105,7 +117,7 @@ fn get_interface_by_name(name: &str) -> Option<&'static mut dyn Interface> {
 }
 
 fn get_interface_by_index(idx: usize) -> Option<&'static mut dyn Interface> {
-    for (i, iface) in INTERFACES.into_iter().enumerate() {
+    for (i, iface) in INTERFACES.get_or_init().into_iter().enumerate() {
         if i == idx {
             return Some(iface.inner());
         }
@@ -135,7 +147,7 @@ pub fn print_interface_list(writer: &mut impl core::fmt::Write) -> core::fmt::Re
     let mut tx_postfix = 'B';
     let mut rx_postfix = 'B';
 
-    for i in &INTERFACES {
+    for i in INTERFACES.get_or_init() {
         let tx = bytesize(i.txbytes, &mut tx_postfix);
         let rx = bytesize(i.rxbytes, &mut rx_postfix);
 
@@ -222,6 +234,8 @@ pub struct TxState {
     pub(crate) sender_count: u8,
     pub(crate) fragment_count: u8,
     pub(crate) tx_count: usize,
+    #[cfg(feature = "embassy_stm32")]
+    pub(crate) ticket: usize,
 }
 
 pub struct InterfacePrivate {
@@ -357,18 +371,39 @@ impl InterfacePrivate {
 /// Linked list to store Interfaces
 pub(crate) struct IfList {
     iface: AtomicPtr<InterfacePrivate>,
+    loopback: AtomicPtr<InterfacePrivate>,
 }
 
 impl IfList {
-    const fn new() -> Self {
+    fn new(loopback: &'static mut dyn Interface) -> Self {
+        let loopback_interface = loopback as *mut dyn Interface;
+        let (loopback_ptr, loopback_id) = {
+            let loopback_private = loopback.private();
+            loopback_private.bind(loopback_interface);
+            loopback_private.is_loop_back = true;
+            loopback_private.removed.store(false, Ordering::Release);
+            (
+                loopback_private as *mut InterfacePrivate,
+                loopback_private.id(),
+            )
+        };
+        loopback.start(loopback_id);
         Self {
-            iface: AtomicPtr::new(core::ptr::null_mut()),
+            iface: AtomicPtr::new(loopback_ptr),
+            loopback: AtomicPtr::new(loopback_ptr),
         }
     }
 
     #[cfg(test)]
     fn clear(&self) {
-        self.iface.store(core::ptr::null_mut(), Ordering::Release);
+        let loopback = self.loopback.load(Ordering::Acquire);
+        if let Some(loopback) = unsafe { loopback.as_ref() } {
+            loopback
+                .next
+                .store(core::ptr::null_mut(), Ordering::Release);
+            loopback.removed.store(false, Ordering::Release);
+        }
+        self.iface.store(loopback, Ordering::Release);
     }
 
     fn last(&self) -> Option<&InterfacePrivate> {
@@ -424,6 +459,13 @@ impl IfList {
     }
 
     fn remove(&self, iface: InterfaceID) -> bool {
+        if core::ptr::addr_eq(
+            iface.0 as *const InterfacePrivate,
+            self.loopback.load(Ordering::Acquire),
+        ) {
+            return false;
+        }
+
         for i in self {
             if core::ptr::addr_eq(iface.0 as *const InterfacePrivate, i) {
                 i.removed.store(true, Ordering::Release);
@@ -525,7 +567,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_iflist_add() {
-        INTERFACES.clear();
+        INTERFACES.get_or_init().clear();
 
         static mut INTERFACES_ARRAY: [TestInterface; 10] = [
             TestInterface::new(),
@@ -547,10 +589,10 @@ mod tests {
         }
 
         // verify count
-        assert_eq!(INTERFACES.into_iter().count(), 10);
+        assert_eq!(INTERFACES.get_or_init().into_iter().count(), 11);
 
         // verify pointer
-        for (i, iface) in INTERFACES.into_iter().enumerate() {
+        for (i, iface) in INTERFACES.get_or_init().into_iter().skip(1).enumerate() {
             unsafe {
                 assert!(core::ptr::eq(iface.inner(), &INTERFACES_ARRAY[i]));
             }
@@ -560,21 +602,63 @@ mod tests {
     #[test]
     #[serial]
     fn lookup_empty_list() {
-        INTERFACES.clear();
+        INTERFACES.get_or_init().clear();
 
         assert!(get_interface_by_addr(1).is_none());
         assert!(get_interface_by_subnet(1).is_none());
         assert!(get_interface_by_broadcast(1).is_none());
         assert!(get_interface_by_name("eth0").is_none());
-        assert!(get_interface_by_index(0).is_none());
+        assert_eq!(get_interface_by_addr(0).unwrap().name(), "LOOP");
+        assert!(get_interface_by_index(0).is_some());
         assert!(get_interface_by_isdfl().is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn loopback_next_hop_enqueues_a_packet() {
+        INTERFACES.get_or_init().clear();
+
+        let loopback_private = get_interface_by_addr(loopback::LOOPBACK_ADDR)
+            .unwrap()
+            .private() as *mut InterfacePrivate;
+        let mut packet = Packet::get().unwrap();
+        packet.append_data(b"loopback").unwrap();
+
+        unsafe {
+            (&*loopback_private)
+                .next_hop(None, &packet, true)
+                .await
+                .unwrap();
+        }
+
+        let received = crate::qfifo::read().await.unwrap();
+        assert_eq!(received.iface, unsafe { (&*loopback_private).id() });
+        assert_eq!(received.packet.data(), b"loopback");
+    }
+
+    #[test]
+    #[serial]
+    fn loopback_cannot_be_removed() {
+        INTERFACES.get_or_init().clear();
+
+        let loopback = get_interface_by_addr(loopback::LOOPBACK_ADDR)
+            .unwrap()
+            .private()
+            .id();
+        assert!(!remove_interface(loopback));
+        assert_eq!(
+            get_interface_by_addr(loopback::LOOPBACK_ADDR)
+                .unwrap()
+                .name(),
+            "LOOP"
+        );
     }
 
     #[test]
     #[serial]
     #[allow(static_mut_refs)]
     fn remove_nonexistent() {
-        INTERFACES.clear();
+        INTERFACES.get_or_init().clear();
 
         static mut IFACE: TestInterface = TestInterface::new();
 
@@ -588,7 +672,7 @@ mod tests {
     #[test]
     #[serial]
     fn remove_head() {
-        INTERFACES.clear();
+        INTERFACES.get_or_init().clear();
 
         static mut IFACES: [TestInterface; 3] = [
             TestInterface::new(),
@@ -602,9 +686,10 @@ mod tests {
             add_interface(&mut IFACES[2]);
 
             assert!(remove_interface(iface0));
-            assert_eq!(INTERFACES.into_iter().count(), 2);
+            assert_eq!(INTERFACES.get_or_init().into_iter().count(), 3);
             assert!(
                 !INTERFACES
+                    .get_or_init()
                     .into_iter()
                     .any(|p| core::ptr::eq(p.inner(), &IFACES[0]))
             );
@@ -614,7 +699,7 @@ mod tests {
     #[test]
     #[serial]
     fn remove_middle() {
-        INTERFACES.clear();
+        INTERFACES.get_or_init().clear();
 
         static mut IFACES: [TestInterface; 3] = [
             TestInterface::new(),
@@ -628,9 +713,10 @@ mod tests {
             add_interface(&mut IFACES[2]);
 
             assert!(remove_interface(iface1));
-            assert_eq!(INTERFACES.into_iter().count(), 2);
+            assert_eq!(INTERFACES.get_or_init().into_iter().count(), 3);
             assert!(
                 !INTERFACES
+                    .get_or_init()
                     .into_iter()
                     .any(|p| core::ptr::eq(p.inner(), &IFACES[1]))
             );
@@ -640,7 +726,7 @@ mod tests {
     #[test]
     #[serial]
     fn remove_tail() {
-        INTERFACES.clear();
+        INTERFACES.get_or_init().clear();
 
         static mut IFACES: [TestInterface; 3] = [
             TestInterface::new(),
@@ -654,9 +740,10 @@ mod tests {
             let iface2 = add_interface(&mut IFACES[2]);
 
             assert!(remove_interface(iface2));
-            assert_eq!(INTERFACES.into_iter().count(), 2);
+            assert_eq!(INTERFACES.get_or_init().into_iter().count(), 3);
             assert!(
                 !INTERFACES
+                    .get_or_init()
                     .into_iter()
                     .any(|p| core::ptr::eq(p.inner(), &IFACES[2]))
             );
@@ -667,18 +754,18 @@ mod tests {
     #[serial]
     #[allow(static_mut_refs)]
     fn remove_single() {
-        INTERFACES.clear();
+        INTERFACES.get_or_init().clear();
 
         static mut IFACE: TestInterface = TestInterface::new();
 
         unsafe {
             let iface0 = add_interface(&mut IFACE);
 
-            assert_eq!(INTERFACES.into_iter().count(), 1);
+            assert_eq!(INTERFACES.get_or_init().into_iter().count(), 2);
 
             assert!(remove_interface(iface0));
 
-            assert_eq!(INTERFACES.into_iter().count(), 0);
+            assert_eq!(INTERFACES.get_or_init().into_iter().count(), 1);
         }
     }
 
@@ -686,7 +773,7 @@ mod tests {
     #[serial]
     #[allow(static_mut_refs)]
     fn within_subnet() {
-        INTERFACES.clear();
+        INTERFACES.get_or_init().clear();
 
         static mut IFACE: TestInterface = TestInterface::new();
 
@@ -702,7 +789,7 @@ mod tests {
     #[serial]
     #[allow(static_mut_refs)]
     fn check_default_sets_override() {
-        INTERFACES.clear();
+        INTERFACES.get_or_init().clear();
 
         static mut IFACE: TestInterface = TestInterface::new();
 

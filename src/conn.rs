@@ -112,6 +112,13 @@ bitflags! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConnectionID(usize);
 
+impl ConnectionID {
+    #[cfg(test)]
+    pub(crate) const fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+}
+
 pub(crate) struct ConnectionBuf {
     /// used for alloc/dealloc
     id: ConnectionID,
@@ -217,34 +224,11 @@ impl ConnectionBuf {
     }
 }
 
-pub struct Connection {
+pub(crate) struct Connection {
     inner: &'static mut ConnectionBuf,
 }
 
 impl Connection {
-    pub(crate) fn find_dport(dport: u8) -> Option<Connection> {
-        // loop over connections
-        for i in 0..CSP_CONN_MAX {
-            let conn = unsafe { &mut CONN_POOL[i] };
-
-            if conn.idin.dport != dport {
-                continue;
-            }
-
-            if conn.conn_state.is_closed() {
-                continue;
-            }
-
-            if conn.conn_type != ConnType::Client {
-                continue;
-            }
-
-            return Some(Connection { inner: conn });
-        }
-
-        return None;
-    }
-
     pub(crate) fn find_existing(id: &CspId) -> Option<Connection> {
         // loop over connections
         for i in 0..CSP_CONN_MAX {
@@ -484,6 +468,10 @@ impl Connection {
         self.inner.idout.prio = prio
     }
 
+    pub(crate) fn set_fragmented(&mut self) {
+        self.inner.idout.flags |= Flags::CSP_FFRAG;
+    }
+
     pub(crate) fn idout(&self) -> &CspId {
         &self.inner.idout
     }
@@ -510,10 +498,6 @@ impl Connection {
 
     pub(crate) fn set_options(&mut self, opt: ConnOptions) {
         self.inner.opts = opt;
-    }
-
-    pub(crate) fn flags(&self) -> Flags {
-        return self.inner.idin.flags;
     }
 
     pub(crate) fn timestamp(&self) -> u32 {

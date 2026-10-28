@@ -43,7 +43,9 @@ pub(crate) async fn send_direct(
 
     /* Quickly send on loopback */
     if idout.dst == LOOPBACK_ADDR {
-        send_direct_iface(idout, packet, todo!(), via, from_me).await?;
+        let loopback = crate::interfaces::get_interface_by_addr(LOOPBACK_ADDR)
+            .ok_or(Error::InvalidOperation)?;
+        send_direct_iface(idout, packet, loopback.private(), via, from_me).await?;
         return Ok(());
     }
     let mut next_iface: Option<&mut InterfacePrivate> = None;
@@ -52,7 +54,7 @@ pub(crate) async fn send_direct(
     // Try to find the destination on any local subnets
     let mut local_found = false;
     // iterate interfaces
-    for iface in INTERFACES.into_iter() {
+    for iface in INTERFACES.get_or_init().into_iter() {
         // skip interfaces not in subnet
         if !iface.is_within_subnet(idout.dst) {
             continue;
@@ -60,7 +62,7 @@ pub(crate) async fn send_direct(
         local_found = true;
 
         // Do not send back to same interface (split horizon)
-        if routed_from.is_none_or(|rf| is_same_subnet(iface, rf)) {
+        if routed_from.is_some_and(|rf| is_same_subnet(iface, rf)) {
             continue;
         }
 
@@ -90,49 +92,65 @@ pub(crate) async fn send_direct(
 
     #[cfg(feature = "rtable")]
     {
-        /* Try to send via routing table */
-        let mut route_found = false;
-        let mut route = csp_rtable_find_route(idout.dst);
+        let routes = crate::rtable::find_routes(idout.dst).await;
+        if routes.len() > 0 {
+            let mut original_packet = Some(packet);
+            let mut candidates = [None; crate::rtable::CSP_RTABLE_SIZE];
+            let mut candidate_count = 0;
 
-        while let Some(route) = route {
-            route_found = 1;
-
-            /* Do not send back to same interface (split horizon)  */
-            if (is_same_subnet(route.iface, routed_from)) {
-                continue;
+            for index in 0..routes.len() {
+                let Some(route) = routes.get(index) else {
+                    continue;
+                };
+                let Some(iface) = crate::interfaces::get_interface_by_id(route.iface) else {
+                    continue;
+                };
+                if routed_from.is_some_and(|source| is_same_subnet(iface.private(), source)) {
+                    continue;
+                }
+                candidates[candidate_count] = Some(route);
+                candidate_count += 1;
             }
 
-            if (next_iface != NULL) {
-                csp_packet_t * copy = csp_buffer_clone(packet);
-                send_packet(&idout_copy, copy, next_iface, via, from_me);
+            for index in 0..candidate_count {
+                let route = candidates[index].expect("candidate route is populated");
+                let iface = crate::interfaces::get_interface_by_id(route.iface)
+                    .expect("registered route interface remains available");
+                let outgoing_packet = if index + 1 == candidate_count {
+                    original_packet.take().expect("original packet is retained")
+                } else {
+                    original_packet
+                        .as_ref()
+                        .expect("original packet is retained")
+                        .buffer_clone()
+                        .ok_or(Error::AllocError)?
+                };
+                send_packet(
+                    &mut idout_copy,
+                    outgoing_packet,
+                    iface.private(),
+                    route.via,
+                    from_me,
+                )
+                .await?;
             }
-            next_iface = route.iface;
-            via = route.via;
 
-            route = csp_rtable_search_backward(route);
-        }
-
-        /* If the above worked, we don't want to look at default interfaces */
-        if (route_found == 1) {
-            if (next_iface != NULL) {
-                send_packet(&idout_copy, packet, next_iface, via, from_me);
-            } else {
-                csp_buffer_free(packet);
-            }
-            return;
+            // A matching route suppresses default-route fallback, even when
+            // split horizon excludes every route.
+            return Ok(());
         }
     }
 
     next_iface = None;
 
     /* Try to send via default interfaces */
-    for iface in INTERFACES.into_iter() {
+    for iface in INTERFACES.get_or_init().into_iter() {
         // skip non-default interfaces
         if !iface.is_default() {
             continue;
         }
 
-        if routed_from.is_none_or(|rf| is_same_subnet(iface, rf)) {
+        if routed_from.is_some_and(|rf| is_same_subnet(iface, rf)) {
             continue;
         }
 
@@ -163,6 +181,31 @@ pub(crate) async fn send_direct_iface(
     via: Option<u16>,
     from_me: bool,
 ) -> Result<(), Error> {
+    #[cfg(feature = "defmt")]
+    {
+        let src = idout.src;
+        let dst = idout.dst;
+        let dst_port = idout.dport;
+        let src_port = idout.sport;
+        let priority = idout.prio as u8;
+        let flags = idout.flags.bits();
+        let length = packet.data_length() as u16;
+        let next_hop = via.unwrap_or(dst);
+        defmt::trace!(
+            "CSP tx src={=u16}:{=u8} dst={=u16}:{=u8} prio={=u8} flags={=u8} len={=u16} iface={=str} via={=u16} time={=u32}",
+            src,
+            src_port,
+            dst,
+            dst_port,
+            priority,
+            flags,
+            length,
+            iface.name(),
+            next_hop,
+            crate::arch::get_ms()
+        );
+    }
+
     /* Copy identifier to packet (before crc and hmac) */
     if idout != &packet.id {
         packet.id = *idout;
@@ -174,7 +217,10 @@ pub(crate) async fn send_direct_iface(
         if idout.flags.contains(Flags::CSP_FHMAC) {
             // Calculate and add HMAC (does not include header for backwards compatibility with csp1.x)
             #[cfg(feature = "hmac")]
-            todo!();
+            if crate::crypto::hmac::append(&mut packet, false).is_err() {
+                iface.tx_error += 1;
+                return Err(Error::BufferOverflow);
+            }
 
             if !cfg!(feature = "hmac") {
                 drop(packet);
@@ -291,7 +337,7 @@ async fn transaction_w_opts(
     return Ok(length);
 }
 
-async fn send_to(
+pub(crate) async fn send_to(
     prio: Priority,
     dest: u16,
     dport: u8,

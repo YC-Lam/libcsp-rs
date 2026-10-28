@@ -1,8 +1,8 @@
 use core::task::{Context, Poll};
 
-use embassy_stm32::can::{BufferedCanSender, BufferedCanReceiver, Frame};
-use embedded_can::Id;
 use embassy_executor::SendSpawner;
+use embassy_stm32::can::{BufferedCanReceiver, BufferedCanSender, Frame};
+use embedded_can::Id;
 
 use crate::interfaces::InterfaceID;
 use crate::interfaces::can::{self, CanInterfaceDriver};
@@ -11,26 +11,44 @@ use crate::{Error, Packet};
 /// Embassy STM32 CAN transmitter backed by the HAL's buffered classic CAN
 /// interface. The application owns peripheral initialization and buffer storage.
 ///
-/// For example, with a bxCAN peripheral, allocate the HAL's TX/RX queues and
-/// turn the peripheral into a `BufferedCan`. The peripheral and buffers must
-/// remain alive while the CSP interface is in use:
+/// For example, with an FDCAN peripheral, configure it and allocate the HAL's
+/// TX/RX queues before creating the CSP interface. Keep the buffered peripheral
+/// and buffers alive for as long as the interface is in use. Registering the
+/// interface starts its receive task:
 ///
 /// ```ignore
-/// use embassy_stm32::can::CanConfigurator;
+/// use embassy_stm32::can::fdcan::{CanConfigurator, RxBuf, TxBuf};
+/// use embassy_executor::Spawner;
+/// use embassy_sync::channel::Channel;
 /// use static_cell::StaticCell;
-/// use csp::{add_interface, CanInterface};
+/// use csp::interfaces::{add_interface, can::CanInterface};
 /// use csp::drivers::embassy_stm32::CanStm32Driver;
 ///
+/// static TX_BUF: StaticCell<TxBuf<16>> = StaticCell::new();
+/// static RX_BUF: StaticCell<RxBuf<16>> = StaticCell::new();
 /// static CAN_IFACE: StaticCell<CanInterface<CanStm32Driver>> = StaticCell::new();
 ///
-/// // Construct the peripheral for your MCU, pins, and CAN interrupts.
-/// let mut can = CanConfigurator::new(peripherals.FDCAN1, peripherals.PA11, peripherals.PA12, Irqs);
+/// // In your Embassy main/task, construct it for your MCU, pins, and IRQ bindings.
+/// let mut configurator =
+///     CanConfigurator::new(peripherals.FDCAN1, peripherals.PA11, peripherals.PA12, Irqs);
+/// configurator.set_bitrate(500_000);
+/// let can = configurator.into_normal_mode();
 ///
-/// let driver = CanStm32Driver::new(can, spawner, 500_000, filter_addr, filter_netmask);
+/// let can = can.buffered(
+///     TX_BUF.init(Channel::new()),
+///     RX_BUF.init(Channel::new()),
+/// );
+/// let driver = CanStm32Driver::new(
+///     can.writer(),
+///     can.reader(),
+///     spawner.make_send(),
+/// );
 ///
-/// let iface = CAN_IFACE.init(CanInterface::new(addr, "CAN", true, driver));
+/// let iface = CAN_IFACE.init(CanInterface::new(1, "CAN", true, driver));
 /// let iface_id = add_interface(iface);
 ///
+/// // `add_interface` calls the interface's start hook, which spawns the RX task.
+/// // Keep `can` in scope while CSP uses this interface.
 /// ```
 pub struct CanStm32Driver {
     spawner: SendSpawner,
@@ -39,25 +57,20 @@ pub struct CanStm32Driver {
 }
 
 impl CanStm32Driver {
-    /// Create a driver from the transmitter returned by
-    /// `embassy_stm32::can::BufferedCan::writer()`.
+    /// Create a driver from a buffered CAN writer, receiver, and task spawner.
+    ///
+    /// The receive task is spawned automatically when the CSP interface is
+    /// registered with `add_interface`.
     pub const fn new(tx: BufferedCanSender, rx: BufferedCanReceiver, spawner: SendSpawner) -> Self {
-        Self { 
-            tx,
-            rx,
-            spawner
-        }
+        Self { tx, rx, spawner }
     }
 }
 
 impl CanInterfaceDriver for CanStm32Driver {
-    fn spawn_rx_task(&mut self, id: InterfaceID){
-        // start can interface
-        if let Ok(token) = can_rx_task(self.rx.clone(), id){
-            self.spawner.spawn(token);
-        } else{
-            // todo
-        }
+    fn spawn_rx_task(&mut self, id: InterfaceID) {
+        let token = can_rx_task(self.rx.clone(), id)
+            .unwrap_or_else(|error| panic!("failed to create CAN receive task: {error}"));
+        self.spawner.spawn(token);
     }
 
     fn poll_tx_frame(
@@ -91,9 +104,9 @@ impl CanInterfaceDriver for CanStm32Driver {
 }
 
 #[embassy_executor::task(pool_size = 6)]
-async fn can_rx_task(rx: BufferedCanReceiver, iface: InterfaceID){
-    loop{
-        if let Ok(envelope) = rx.receive().await{
+async fn can_rx_task(rx: BufferedCanReceiver, iface: InterfaceID) {
+    loop {
+        if let Ok(envelope) = rx.receive().await {
             let timestamp_rx = timestamp_to_ms(envelope.ts);
             let frame = envelope.frame;
 
@@ -105,7 +118,6 @@ async fn can_rx_task(rx: BufferedCanReceiver, iface: InterfaceID){
 
             let _ = can::receive(iface, id, frame.data(), timestamp_rx).await;
         };
-        
     }
 }
 

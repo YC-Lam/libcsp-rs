@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 
 use crate::Error;
@@ -161,20 +162,30 @@ impl<T, const N: usize> Queue<T, N> {
 }
 
 pub struct Semaphore<const N: usize> {
-    inner: tokio::sync::Semaphore,
+    available: AtomicBool,
+    notify: tokio::sync::Notify,
 }
 
 impl<const N: usize> Semaphore<N> {
     /// Equivalent to csp_bin_sem_init(): initially unlocked.
     pub const fn new() -> Self {
         Self {
-            inner: tokio::sync::Semaphore::const_new(1),
+            available: AtomicBool::new(true),
+            notify: tokio::sync::Notify::const_new(),
         }
     }
 
     /// Equivalent to csp_bin_sem_wait().
     /// timeout_ms == CSP_MAX_TIMEOUT means wait indefinitely.
     pub async fn wait(&self, timeout_ms: u32) -> Result<(), Error> {
+        if self.available.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        if timeout_ms == 0 {
+            return Err(Error::Timeout);
+        }
+
         if timeout_ms == u32::MAX {
             self.wait_inner().await;
             return Ok(());
@@ -186,12 +197,41 @@ impl<const N: usize> Semaphore<N> {
     }
 
     async fn wait_inner(&self) {
-        let _ = self.inner.acquire().await;
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self.available.swap(false, Ordering::AcqRel) {
+                return;
+            }
+
+            notified.await;
+        }
     }
 
     /// Equivalent to csp_bin_sem_post().
     /// Posting an already available semaphore is a no-op.
     pub fn post(&self) {
-        self.inner.add_permits(1);
+        if !self.available.swap(true, Ordering::AcqRel) {
+            self.notify.notify_one();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn semaphore_wait_consumes_and_post_releases_a_single_permit() {
+        let semaphore = Semaphore::<1>::new();
+
+        assert_eq!(semaphore.wait(0).await, Ok(()));
+        assert_eq!(semaphore.wait(0).await, Err(Error::Timeout));
+
+        semaphore.post();
+        assert_eq!(semaphore.wait(0).await, Ok(()));
+        assert_eq!(semaphore.wait(0).await, Err(Error::Timeout));
     }
 }

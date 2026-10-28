@@ -8,10 +8,10 @@ use core::sync::atomic::{AtomicU8, Ordering};
 #[cfg(feature = "embassy")]
 pub use embassy::*;
 
-#[cfg(all(feature = "tokio", not(feature = "embassy")))]
+#[cfg(all(feature = "std", not(feature = "embassy")))]
 mod tokio;
 
-#[cfg(all(feature = "tokio", not(feature = "embassy")))]
+#[cfg(all(feature = "std", not(feature = "embassy")))]
 pub use tokio::*;
 
 const UNINIT: u8 = 0;

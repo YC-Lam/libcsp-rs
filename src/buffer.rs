@@ -244,7 +244,7 @@ impl PacketBuf {
         let re = crc_data.eq(&self.get_crc32());
 
         // Compare calculated checksum without packet header if failed
-        if !re {
+        let valid = if !re {
             // calculate CRC without header
             let mut crc = CRC32::new();
             crc.update(&self.data[..((self.length as usize) - size_of::<u32>())]);
@@ -253,10 +253,15 @@ impl PacketBuf {
             // convert to network byte order
             let crc_data = crc_value.to_be_bytes();
 
-            return crc_data.eq(&self.get_crc32());
-        }
+            crc_data.eq(&self.get_crc32())
+        } else {
+            true
+        };
 
-        return true;
+        if valid {
+            self.remove_data(size_of::<u32>());
+        }
+        valid
     }
 
     /// convert id into header
@@ -279,18 +284,6 @@ impl PacketBuf {
         self.header = [0; _];
         self.header_length = 0;
         self.length = 0;
-    }
-
-    /// extract and store ID, calculate data length
-    pub(crate) fn strip_id(&mut self) -> bool {
-        if self.frame_length() < crate::id::get_header_size() {
-            return false;
-        }
-
-        self.id = CspId::from_header(self.frame());
-        self.length = (self.frame_length() - crate::id::get_header_size()) as _;
-
-        return true;
     }
 
     pub(crate) fn clear_id(&mut self) {
@@ -476,7 +469,7 @@ mod tests {
         packet.append_data(&[1, 2, 3, 4]).unwrap();
         packet.append_crc32().unwrap();
 
-        packet.strip_id();
+        packet.header_length = 0;
 
         assert!(packet.verify_crc32());
     }

@@ -4,7 +4,7 @@ use crate::buffer::CSP_BUFFER_SIZE;
 use crate::id::CspId;
 use crate::{Error, Packet};
 
-use super::{TxState, Interface, InterfaceID, InterfacePrivate};
+use super::{Interface, InterfaceID, InterfacePrivate, TxState};
 
 const CAN_FRAME_SIZE: usize = 8;
 const RX_BUFFER_TIMEOUT_MS: u32 = 1_000;
@@ -360,10 +360,17 @@ mod tests {
     use super::*;
     use crate::id::{Flags, Priority};
     use core::task::Waker;
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::task::Wake;
     use std::vec;
     use std::vec::Vec;
+
+    enum DriverResult {
+        Ready,
+        Pending,
+        Error(Error),
+    }
 
     struct Frame {
         id: u32,
@@ -374,6 +381,7 @@ mod tests {
     #[derive(Default)]
     struct TestDriver {
         frames: Mutex<Vec<Frame>>,
+        results: Mutex<VecDeque<DriverResult>>,
     }
 
     impl CanInterfaceDriver for TestDriver {
@@ -384,17 +392,28 @@ mod tests {
             data: &[u8],
             packet: Option<&Packet>,
         ) -> Poll<Result<(), Error>> {
-            self.frames.lock().unwrap().push(Frame {
-                id,
-                data: data.to_vec(),
-                has_packet: packet.is_some(),
-            });
-            Poll::Ready(Ok(()))
+            let result = self
+                .results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(DriverResult::Ready);
+
+            match result {
+                DriverResult::Ready => {
+                    self.frames.lock().unwrap().push(Frame {
+                        id,
+                        data: data.to_vec(),
+                        has_packet: packet.is_some(),
+                    });
+                    Poll::Ready(Ok(()))
+                }
+                DriverResult::Pending => Poll::Pending,
+                DriverResult::Error(error) => Poll::Ready(Err(error)),
+            }
         }
 
-        fn spawn_rx_task(&mut self, _id: InterfaceID) {
-            
-        }
+        fn spawn_rx_task(&mut self, _id: InterfaceID) {}
     }
 
     struct NoopWake;
@@ -430,6 +449,20 @@ mod tests {
             | ((fragment as u32) << CFP2_FRAGMENT_COUNT_OFFSET)
             | ((begin as u32) << CFP2_BEGIN_OFFSET)
             | end as u32
+    }
+
+    fn begin_data(packet: &Packet, payload: &[u8]) -> Vec<u8> {
+        let header = packet.id.to_header();
+        let mut data = header[2..].to_vec();
+        data.extend_from_slice(payload);
+        data
+    }
+
+    fn receive_buffer_count<D: CanInterfaceDriver>(can: &CanInterface<D>) -> usize {
+        can.rx_packets
+            .iter()
+            .filter(|packet| packet.is_some())
+            .count()
     }
 
     #[test]
@@ -492,5 +525,331 @@ mod tests {
         assert_eq!(received.data(), payload);
         assert_eq!(received.timestamp_rx, 30);
         assert_eq!(received.id, csp_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tx_handles_cfp2_fragment_boundaries() {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+
+        for length in [0usize, 1, 4, 5, 12, 13, 20, 21, 80, CSP_BUFFER_SIZE] {
+            let payload = (0..length).map(|byte| byte as u8).collect::<Vec<_>>();
+            let packet = test_packet(&payload);
+            let csp_header = packet.id.to_header();
+            let packet_prio = packet.id.prio as u32;
+            let packet_dst = packet.id.dst;
+            let mut can = CanInterface::new(0x234, "CAN", false, TestDriver::default());
+            let mut state = TxState::default();
+            let mut polls = 0;
+
+            while can.poll_tx(&mut cx, &packet, &mut state).is_pending() {
+                polls += 1;
+                assert!(polls <= 36, "transmit did not finish");
+            }
+
+            let frames = can.driver.frames.lock().unwrap();
+            let expected_frame_count = if length <= 4 {
+                1
+            } else {
+                1 + (length - 4).div_ceil(CAN_FRAME_SIZE)
+            };
+            assert_eq!(
+                frames.len(),
+                expected_frame_count,
+                "payload length {length}"
+            );
+            assert_eq!(&frames[0].data[..4], &csp_header[2..]);
+            assert_eq!(&frames[0].data[4..], &payload[..length.min(4)]);
+            assert_eq!((frames[0].id >> CFP2_PRIO_OFFSET) & 0x3, packet_prio);
+            assert_eq!(
+                (frames[0].id >> CFP2_DST_OFFSET) & 0x3fff,
+                packet_dst as u32
+            );
+            assert_eq!((frames[0].id >> CFP2_SENDER_OFFSET) & 0x3f, 0x234 & 0x3f);
+            assert_eq!((frames[0].id >> CFP2_PACKET_COUNT_OFFSET) & 0x3, 0);
+            assert_ne!(frames[0].id & (1 << CFP2_BEGIN_OFFSET), 0);
+            assert_eq!(frames[0].id & (1 << CFP2_END_OFFSET) != 0, length <= 4);
+            assert_eq!(frames[0].has_packet, length <= 4);
+
+            let mut payload_offset = 4.min(length);
+            for (fragment_index, frame) in frames.iter().enumerate().skip(1) {
+                let count = (length - payload_offset).min(CAN_FRAME_SIZE);
+                assert_eq!(
+                    frame.data,
+                    payload[payload_offset..payload_offset + count],
+                    "payload length {length}, fragment {fragment_index}"
+                );
+                assert_eq!(
+                    (frame.id >> CFP2_FRAGMENT_COUNT_OFFSET) & 0x7,
+                    (fragment_index as u32) & 0x7
+                );
+                let is_last = payload_offset + count == length;
+                assert_eq!(frame.id & (1 << CFP2_END_OFFSET) != 0, is_last);
+                assert_eq!(frame.has_packet, is_last);
+                payload_offset += count;
+            }
+            assert_eq!(payload_offset, length);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tx_packet_counter_wraps_after_two_bits() {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+        let mut can = CanInterface::new(0x234, "CAN", false, TestDriver::default());
+
+        for expected_count in 0..6 {
+            let packet = test_packet(&[]);
+            let mut state = TxState::default();
+            assert!(can.poll_tx(&mut cx, &packet, &mut state).is_ready());
+            let frames = can.driver.frames.lock().unwrap();
+            assert_eq!(
+                (frames.last().unwrap().id >> CFP2_PACKET_COUNT_OFFSET) & 0x3,
+                (expected_count & 0x3) as u32
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tx_keeps_fragment_when_driver_is_pending_and_reports_errors() {
+        let payload = (0..13).collect::<Vec<u8>>();
+        let packet = test_packet(&payload);
+        let driver = TestDriver::default();
+        driver.results.lock().unwrap().extend([
+            DriverResult::Pending,
+            DriverResult::Ready,
+            DriverResult::Error(Error::CanBusError),
+        ]);
+        let mut can = CanInterface::new(0x234, "CAN", false, driver);
+        let mut state = TxState::default();
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(can.poll_tx(&mut cx, &packet, &mut state).is_pending());
+        assert!(!state.first_frame_sent);
+        assert_eq!(state.tx_count, 0);
+        assert!(can.driver.frames.lock().unwrap().is_empty());
+
+        assert!(can.poll_tx(&mut cx, &packet, &mut state).is_pending());
+        assert!(state.first_frame_sent);
+        assert_eq!(state.tx_count, 4);
+
+        assert!(matches!(
+            can.poll_tx(&mut cx, &packet, &mut state),
+            Poll::Ready(Err(Error::CanBusError))
+        ));
+        assert_eq!(state.tx_count, 4);
+        assert_eq!(can.iface.tx_error, 1);
+        assert_eq!(can.driver.frames.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rx_rejects_non_begin_or_malformed_begin_frames() {
+        let packet = test_packet(&[]);
+        let id = cfp2_id(packet.id, 3, 0, 0, false, false);
+        let mut can = CanInterface::new(0x234, "CAN", false, TestDriver::default());
+
+        assert!(matches!(
+            can.process_frame(id, &[1, 2, 3], 10),
+            Err(Error::InvalidOperation)
+        ));
+        let malformed_begin = cfp2_id(packet.id, 3, 0, 0, true, true);
+        assert!(matches!(
+            can.process_frame(malformed_begin, &[1, 2, 3], 10),
+            Err(Error::InvalidOperation)
+        ));
+        assert_eq!(can.iface.frame, 2);
+        assert_eq!(receive_buffer_count(&can), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rx_drops_sequence_mismatch_and_accepts_restarted_packet() {
+        let payload = [1, 2, 3, 4, 5];
+        let packet = test_packet(&payload);
+        let csp_id = packet.id;
+        let mut can = CanInterface::new(0x234, "CAN", false, TestDriver::default());
+
+        assert!(
+            can.process_frame(
+                cfp2_id(csp_id, 3, 1, 0, true, false),
+                &begin_data(&packet, &payload[..4]),
+                10
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(receive_buffer_count(&can), 1);
+
+        assert!(matches!(
+            can.process_frame(cfp2_id(csp_id, 3, 1, 2, false, true), &payload[4..], 20),
+            Err(Error::InvalidOperation)
+        ));
+        assert_eq!(receive_buffer_count(&can), 0);
+
+        assert!(
+            can.process_frame(
+                cfp2_id(csp_id, 3, 1, 0, true, false),
+                &begin_data(&packet, &payload[..4]),
+                30
+            )
+            .unwrap()
+            .is_none()
+        );
+        let received = can
+            .process_frame(cfp2_id(csp_id, 3, 1, 1, false, true), &payload[4..], 40)
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.data(), payload);
+        assert_eq!(received.timestamp_rx, 40);
+        assert_eq!(can.iface.frame, 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rx_restarts_duplicate_begin_and_rewrites_broadcast_destination() {
+        let payload = [9, 8, 7, 6, 5];
+        let mut packet = test_packet(&payload);
+        packet.id.dst = 0x3fff;
+        let csp_id = packet.id;
+        let mut can = CanInterface::new(0x234, "CAN", false, TestDriver::default());
+
+        assert!(
+            can.process_frame(
+                cfp2_id(csp_id, 4, 2, 0, true, false),
+                &begin_data(&packet, &[1, 2, 3, 4]),
+                10
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            can.process_frame(
+                cfp2_id(csp_id, 4, 2, 0, true, false),
+                &begin_data(&packet, &payload[..4]),
+                20
+            )
+            .unwrap()
+            .is_none()
+        );
+        let received = can
+            .process_frame(cfp2_id(csp_id, 4, 2, 1, false, true), &payload[4..], 30)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(received.data(), payload);
+        let received_dst = received.id.dst;
+        assert_eq!(received_dst, 0x234);
+        assert_eq!(received.timestamp_rx, 30);
+        assert_eq!(receive_buffer_count(&can), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rx_drops_oversized_packets_and_cleans_expired_reassemblies() {
+        let payload = vec![0x5a; CSP_BUFFER_SIZE];
+        let packet = test_packet(&payload);
+        let csp_id = packet.id;
+        let mut can = CanInterface::new(0x234, "CAN", false, TestDriver::default());
+        let first = begin_data(&packet, &[0x5a; 4]);
+        assert!(
+            can.process_frame(cfp2_id(csp_id, 5, 1, 0, true, false), &first, 10)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut fragment = 1u8;
+        let mut received_bytes = 4usize;
+        while received_bytes + CAN_FRAME_SIZE <= CSP_BUFFER_SIZE {
+            assert!(
+                can.process_frame(
+                    cfp2_id(csp_id, 5, 1, fragment, false, false),
+                    &[0x5a; CAN_FRAME_SIZE],
+                    20
+                )
+                .unwrap()
+                .is_none()
+            );
+            received_bytes += CAN_FRAME_SIZE;
+            fragment = (fragment + 1) & 0x7;
+        }
+
+        assert!(matches!(
+            can.process_frame(
+                cfp2_id(csp_id, 5, 1, fragment, false, true),
+                &[0x5a; CAN_FRAME_SIZE],
+                30
+            ),
+            Err(Error::BufferOverflow)
+        ));
+        assert_eq!(can.iface.rx_error, 1);
+        assert_eq!(receive_buffer_count(&can), 0);
+
+        assert!(
+            can.process_frame(cfp2_id(csp_id, 5, 2, 0, true, false), &first, 40)
+                .unwrap()
+                .is_none()
+        );
+        can.rx_packets
+            .iter_mut()
+            .flatten()
+            .next()
+            .expect("partial packet allocated")
+            .last_used = crate::arch::get_ms().wrapping_sub(RX_BUFFER_TIMEOUT_MS + 1);
+        assert!(matches!(
+            can.process_frame(cfp2_id(csp_id, 5, 2, 1, false, true), &[1], 50),
+            Err(Error::InvalidOperation)
+        ));
+        assert_eq!(receive_buffer_count(&can), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rx_rejects_invalid_dlc_and_extended_identifier_range() {
+        let packet = test_packet(&[]);
+        let mut can = CanInterface::new(0x234, "CAN", false, TestDriver::default());
+
+        assert!(matches!(
+            can.process_frame(0, &[0; CAN_FRAME_SIZE + 1], 0),
+            Err(Error::InvalidOperation)
+        ));
+        assert!(matches!(
+            can.process_frame(0x2000_0000, &[], 0),
+            Err(Error::InvalidOperation)
+        ));
+        let short_id = cfp2_id(packet.id, 1, 0, 0, true, true);
+        assert!(
+            can.process_frame(short_id, &packet.id.to_header()[2..], 0)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(can.iface.frame, 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn aliases_are_local_destinations_and_duplicate_aliases_are_ignored() {
+        let mut can = CanInterface::new(0x234, "CAN", false, TestDriver::default());
+        let mut packet = test_packet(&[]);
+
+        packet.id.dst = 0x234;
+        assert!(can.is_loopback_destination(&packet));
+        can.alias_add(0x345).unwrap();
+        can.alias_add(0x345).unwrap();
+        assert!(can.is_local_address(0x345));
+        packet.id.dst = 0x345;
+        assert!(can.is_loopback_destination(&packet));
+        assert!(!can.is_local_address(0x456));
+        assert_eq!(can.alias_count, 1);
+
+        for addr in 0x400..0x407 {
+            can.alias_add(addr).unwrap();
+        }
+        assert_eq!(can.alias_count, MAX_ALIASES);
+        assert!(matches!(can.alias_add(0x407), Err(Error::BufferOverflow)));
     }
 }

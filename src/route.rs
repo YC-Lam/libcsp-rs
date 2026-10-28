@@ -1,7 +1,7 @@
 use crate::conn::{ConnType, Connection};
 use crate::id::CspId;
 use crate::interfaces::InterfacePrivate;
-use crate::port::{ConnOrPacket, Socket, SocketOptions};
+use crate::port::{ConnOrPacket, SocketOptions, SocketState};
 use crate::*;
 
 /**
@@ -56,8 +56,7 @@ fn security_check(
     #[cfg(feature = "hmac")]
     if packet.id.flags.contains(Flags::CSP_FHMAC) {
         /* Verify HMAC (does not include header for backwards compatibility with csp1.x) */
-        if todo!() {
-            //(csp_hmac_verify(packet, false) != CSP_ERR_NONE) {
+        if crate::crypto::hmac::verify(packet, false).is_err() {
             /* HMAC failed */
             iface.autherr += 1;
             return Err(Error::HMAC);
@@ -79,15 +78,36 @@ fn security_check(
     return Ok(());
 }
 
-fn csp_input_hook(_iface: &mut InterfacePrivate, _packet: &Packet) {
-    //csp_print_packet("INP: S %u, D %u, Dp %u, Sp %u, Pr %u, Fl 0x%02X, Sz %" PRIu16 " VIA: %s, Tms %u\n",
-    //			   packet->id.src, packet->id.dst, packet->id.dport,
-    //			   packet->id.sport, packet->id.pri, packet->id.flags, packet->length, iface->name, csp_get_ms());
+pub(crate) fn csp_input_hook(iface: &mut InterfacePrivate, packet: &Packet) {
+    #[cfg(feature = "defmt")]
+    {
+        let src = packet.id.src;
+        let dst = packet.id.dst;
+        let dst_port = packet.id.dport;
+        let src_port = packet.id.sport;
+        let priority = packet.id.prio as u8;
+        let flags = packet.id.flags.bits();
+        let length = packet.data_length() as u16;
+        defmt::trace!(
+            "CSP rx src={=u16}:{=u8} dst={=u16}:{=u8} prio={=u8} flags={=u8} len={=u16} iface={=str}",
+            src,
+            src_port,
+            dst,
+            dst_port,
+            priority,
+            flags,
+            length,
+            iface.name()
+        );
+    }
+
+    #[cfg(not(feature = "defmt"))]
+    let _ = (iface, packet);
 }
 
 /* Deliver the packet to a connection-less socket.  The socket is the
  * endpoint, so delivery terminates here. */
-async fn deliver_conn_less(socket: &Socket, packet: Packet) {
+async fn deliver_conn_less(socket: &SocketState, packet: Packet) {
     let _ = socket.rx_queue.push(ConnOrPacket::Packet(packet)).await;
 }
 
@@ -96,7 +116,11 @@ async fn deliver_conn_less(socket: &Socket, packet: Packet) {
  * identifier (client or server side), otherwise the socket acts as
  * the factory for a new server-side connection, which is posted to
  * the socket rx_queue for csp_accept(). */
-async fn deliver_connection(conn: Option<Connection>, socket: Option<&Socket>, packet: Packet) {
+async fn deliver_connection(
+    conn: Option<Connection>,
+    socket: Option<&SocketState>,
+    packet: Packet,
+) {
     /* If this is an incoming packet on a new connection */
     let mut conn = if let Some(c) = conn {
         c
@@ -117,7 +141,9 @@ async fn deliver_connection(conn: Option<Connection>, socket: Option<&Socket>, p
 
         /* Store the socket queue and options */
         conn.set_socket_deliverd(false);
-        conn.set_options(ConnOptions::from_bits_truncate(socket.unwrap().opts.bits()));
+        conn.set_options(ConnOptions::from_bits_truncate(
+            socket.unwrap().options().bits(),
+        ));
 
         conn
     };
@@ -157,7 +183,6 @@ pub async fn route_work() {
     };
 
     let mut packet = input.packet;
-
     let iface = match crate::interfaces::get_interface_by_id(input.iface) {
         Some(i) => i.private(),
         None => return,
@@ -176,18 +201,6 @@ pub async fn route_work() {
     //todo: || csp_addr_is_alias(packet.id.dst);
 
     /* Deduplication */
-    /*
-    if ((csp_conf.dedup == CSP_DEDUP_ALL) ||
-        (is_to_me && (csp_conf.dedup == CSP_DEDUP_INCOMING)) ||
-        ((!is_to_me) && (csp_conf.dedup == CSP_DEDUP_FWD))) {
-        if (csp_dedup_is_duplicate(packet)) {
-            /* Discard packet */
-            input.iface->drop++;
-            csp_buffer_free(packet);
-            return CSP_ERR_NONE;
-        }
-    }*/
-
     if cfg!(feature = "dedup_all")
         || (is_to_me && cfg!(feature = "dedup_incoming"))
         || (!is_to_me && cfg!(feature = "dedup_forward"))
@@ -235,20 +248,20 @@ pub async fn route_work() {
 
     /* Socket delivery */
     let socket = crate::port::get_socket(packet.id.dport);
-    let socket = socket.as_ref().map(|s| unsafe { s.as_ref_unchecked() });
-
-    /* Connection-less sockets are ready from csp_bind(),
-     * connection-oriented ones from csp_listen() */
-    if !socket.is_some_and(|s| s.is_ready_to_recieve()) {
-        return;
-    }
 
     /* Resolve the endpoint: an existing connection first, otherwise
      * the bound socket.  Drop the packet if neither exists. */
     let conn = Connection::find_existing(&packet.id);
 
-    if conn.is_none() && socket.is_none() {
-        return;
+    if conn.is_none() {
+        let Some(socket) = socket else {
+            return;
+        };
+        /* Connection-less sockets are ready from csp_bind(),
+         * connection-oriented ones from csp_listen(). */
+        if !socket.is_ready_to_recieve() {
+            return;
+        }
     }
 
     /* Security check with the endpoint options */
@@ -261,7 +274,7 @@ pub async fn route_work() {
             return;
         }
     } else {
-        if let Err(_) = security_check(socket.unwrap().opts, iface, &mut packet) {
+        if let Err(_) = security_check(socket.unwrap().options(), iface, &mut packet) {
             return;
         }
     };

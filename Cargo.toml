@@ -8,11 +8,13 @@ embassy-time = {version = "0.5", optional = true}
 embassy-sync = {version = "0.8", optional = true}
 embassy-stm32 = {version = "0.6", optional = true}
 embassy-executor = {version = "0.10", optional = true}
+embassy-futures = {version = "0.1", optional = true}
 embedded-can = {version = "0.4", optional = true}
 defmt = {version = "1", optional = true}
 tokio = {version = "1", optional = true, features = ["sync", "time"]}
 smol = {version = "2.0", optional = true}
 bitflags = "2.13"
+zmq = { version = "0.10", optional = true }
 
 [target.'cfg(any(unix, target_os = "windows"))'.dependencies]
 libc = "0.2"
@@ -29,19 +31,22 @@ serial_test = "4.0"
 static_cell = "2.1"
 
 [features]
-default = ["tokio", "promisc", "rdp", "hmac"]
+default = ["std", "promisc", "rdp", "hmac"]
 promisc = []
 rdp = []
 hmac = []
 dedup_all = ["dedup_incoming", "dedup_forward"]
 dedup_forward = []
 dedup_incoming = []
+rtable = []
 
-embassy = ["dep:embassy-sync", "dep:embassy-time", "dep:defmt"]
-embassy_stm32 = ["embassy", "dep:embassy-stm32", "dep:embedded-can", "dep:embassy-executor"]
+defmt = ["dep:defmt"]
+embassy = ["dep:embassy-sync", "dep:embassy-time", "defmt"]
+embassy_stm32 = ["embassy", "dep:embassy-stm32", "dep:embedded-can", "dep:embassy-executor", "dep:embassy-futures"]
 embassy_stm32_time = ["embassy_stm32", "embassy-stm32/time"]
 
-tokio = ["dep:tokio", "dep:smol"]
+std = ["dep:tokio", "dep:smol"]
+zmq = ["std", "dep:zmq"]
 
 [[example]]
 name = "can_stm32"
