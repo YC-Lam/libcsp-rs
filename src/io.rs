@@ -261,6 +261,7 @@ pub(crate) async fn send_direct_iface(
     return Ok(());
 }
 
+#[allow(unused_mut)]
 pub(crate) async fn send(conn: &mut Connection, mut packet: Packet) -> Result<(), Error> {
     // check if connection is closed
     if conn.is_closed() {

@@ -22,6 +22,7 @@ pub async fn read(timeout: u32) -> Result<Packet, Error> {
     }
 }
 
+#[allow(unused)]
 pub(crate) async fn add(packet: &Packet) {
     if !PROMISC_ENABLED.load(Ordering::Acquire) {
         return;

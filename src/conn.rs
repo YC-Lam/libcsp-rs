@@ -66,6 +66,7 @@ impl ConnState {
     fn set_closed(&self) {
         self.0.store(Self::CLOSED, Ordering::Release);
     }
+    #[allow(unused)]
     fn is_open(&self) -> bool {
         self.0.load(Ordering::Acquire) == Self::OPEN
     }
@@ -119,6 +120,7 @@ impl ConnectionID {
     }
 }
 
+#[allow(unused)]
 pub(crate) struct ConnectionBuf {
     /// used for alloc/dealloc
     id: ConnectionID,
@@ -310,7 +312,7 @@ impl Connection {
         return None;
     }
 
-    #[allow(unused_variables)]
+    #[allow(unused_variables, unused_mut)]
     pub(crate) async fn connect(
         prio: Priority,
         dest: u16,
@@ -448,10 +450,12 @@ impl Connection {
         self.inner.conn_state.set_closed();
     }
 
+    #[allow(unused)]
     pub(crate) fn rx_free_capacity(&self) -> usize {
         self.inner.rx_queue.free_capacity()
     }
 
+    #[allow(unused)]
     pub(crate) fn connection_id(&self) -> ConnectionID {
         return self.inner.id;
     }
@@ -502,10 +506,12 @@ impl Connection {
         self.inner.opts = opt;
     }
 
+    #[allow(unused)]
     pub(crate) fn timestamp(&self) -> u32 {
         self.inner.timestamp
     }
 
+    #[allow(unused)]
     pub(crate) fn set_timestamp(&mut self, t: u32) {
         self.inner.timestamp = t;
     }
@@ -534,6 +540,7 @@ impl Connection {
         return true;
     }
 
+    #[allow(unused_mut)]
     pub async fn read(&mut self, timeout: u32) -> Result<Packet, Error> {
         let mut timeout = timeout;
 

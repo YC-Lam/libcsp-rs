@@ -111,11 +111,14 @@ async fn deliver_conn_less(socket: &SocketState, packet: Packet) {
     let _ = socket.rx_queue.push(ConnOrPacket::Packet(packet)).await;
 }
 
-/* Deliver the packet to a connection.  The connection is the
+/** 
+ * Deliver the packet to a connection.  The connection is the
  * endpoint: an existing connection, when given, was matched by
  * identifier (client or server side), otherwise the socket acts as
  * the factory for a new server-side connection, which is posted to
- * the socket rx_queue for csp_accept(). */
+ * the socket rx_queue for csp_accept(). 
+ */
+#[allow(unused_mut)]
 async fn deliver_connection(
     conn: Option<Connection>,
     socket: Option<&SocketState>,

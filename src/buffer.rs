@@ -305,10 +305,12 @@ impl PacketBuf {
         self.id.clear()
     }
 
+    #[allow(unused)]
     pub(crate) fn connection(&self) -> Option<ConnectionID> {
         return self.conn;
     }
 
+    #[allow(unused)]
     pub(crate) fn set_connection(&mut self, conn: Option<ConnectionID>) {
         self.conn = conn;
     }

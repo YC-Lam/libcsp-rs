@@ -126,11 +126,13 @@ impl<T, const N: usize> Queue<T, N> {
     }
 }
 
+#[allow(unused)]
 pub struct Semaphore {
     available: AtomicBool,
     notify: tokio::sync::Notify,
 }
 
+#[allow(unused)]
 impl Semaphore {
     /// Equivalent to csp_bin_sem_init(): initially unlocked.
     pub const fn new() -> Self {

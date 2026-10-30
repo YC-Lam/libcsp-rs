@@ -1,4 +1,3 @@
-use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -105,10 +104,12 @@ impl<T, const N: usize> Queue<T, N> {
     }
 }
 
+#[allow(unused)]
 pub struct Semaphore {
     inner: GreedySemaphore<CriticalSectionRawMutex>,
 }
 
+#[allow(unused)]
 impl Semaphore {
     /// Create an initially available binary semaphore.
     pub const fn new() -> Self {

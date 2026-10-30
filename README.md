@@ -5,6 +5,101 @@ upto origin libcsp commit 5ba0ccf
 Enable the optional `defmt` Cargo feature to emit packet-routing, bridge, and RDP
 diagnostics through `defmt`. The `embassy` feature enables `defmt` automatically.
 
+## Connection and transfer flows
+
+### Standard connection
+
+A standard `CspStream` connection is local connection state, not a wire-level
+handshake. The listener accepts the connection when the first client packet
+arrives; the application sends and receives CSP packets over the resulting
+connection.
+
+```mermaid
+sequenceDiagram
+    participant Client as Client application
+    participant ClientCSP as Client CSP
+    participant Network
+    participant ServerCSP as Server CSP
+    participant Server as Server application
+
+    Server->>ServerCSP: bind(port), listen()
+    Client->>ClientCSP: CspStream::connect()
+    Client->>ClientCSP: send(request)
+    ClientCSP->>Network: CSP data packet
+    Network->>ServerCSP: Deliver packet to listening port
+    ServerCSP->>Server: accept() returns stream
+    Server->>ServerCSP: read(request)
+    Server->>ServerCSP: send(response)
+    ServerCSP->>Network: CSP data packet
+    Network->>ClientCSP: Deliver response to client connection
+    Client->>ClientCSP: read(response)
+    Client->>ClientCSP: close()
+    Server->>ServerCSP: close()
+```
+
+### RDP connection
+
+With `ConnOptions::CSP_O_RDP`, CSP establishes the connection on the wire using
+the RDP SYN/SYN-ACK/ACK exchange. Data segments use sequence and acknowledgment
+numbers; the router's regular timeout work handles retransmission and delayed
+ACKs.
+
+```mermaid
+sequenceDiagram
+    participant Client as Client application
+    participant ClientCSP as Client CSP / RDP
+    participant Network
+    participant ServerCSP as Server CSP / RDP
+    participant Server as Server application
+
+    Server->>ServerCSP: bind(port), listen()
+    Client->>ClientCSP: connect(CSP_O_RDP)
+    ClientCSP->>Network: SYN(seq, RDP options)
+    Network->>ServerCSP: SYN
+    ServerCSP->>Network: SYN + ACK(seq, ack)
+    Network->>ClientCSP: SYN + ACK
+    ClientCSP->>Network: ACK
+    Network->>ServerCSP: ACK
+    ServerCSP->>Server: accept() returns established stream
+    Client->>ClientCSP: send(data)
+    ClientCSP->>Network: Data(seq, ack)
+    Network->>ServerCSP: Data(seq, ack)
+    ServerCSP->>Network: ACK (immediate or delayed)
+    Network->>ClientCSP: ACK
+    Server->>ServerCSP: read(data), send(reply)
+    ServerCSP->>Network: Data(seq, ack)
+    Network->>ClientCSP: Data(seq, ack)
+    ClientCSP->>Network: ACK (immediate or delayed)
+    Network->>ServerCSP: ACK
+```
+
+### SFP transfer
+
+`SfpStream` runs on a CSP connection and splits a transfer into packets no
+larger than the selected MTU. Each fragment carries its payload followed by
+its big-endian byte offset and total transfer size. The receiver validates the
+sequence of fragments and calls the write callback with the payload, offset,
+and total size. Enabling RDP adds reliable delivery beneath SFP.
+
+```mermaid
+sequenceDiagram
+    participant Sender as Sender application
+    participant SenderSFP as Sender SFP / CSP
+    participant Network
+    participant ReceiverSFP as Receiver SFP / CSP
+    participant Receiver as Receiver application
+
+    Sender->>SenderSFP: SfpStream::connect(), send(total, mtu, read)
+    Note over SenderSFP,ReceiverSFP: Connection setup follows standard CSP or RDP options
+    loop Each fragment (length <= mtu)
+        Sender->>SenderSFP: read(buffer, offset)
+        SenderSFP->>Network: CSP packet [payload | offset:u32 | total:u32]
+        Network->>ReceiverSFP: CSP_FFRAG packet
+        ReceiverSFP->>Receiver: write(payload, offset, total)
+    end
+    Note over Receiver: Transfer completes when offset + payload length == total
+```
+
 The host-side ZeroMQ PUB/SUB interface is available with the `zmq` feature. It
 connects to a hub's subscriber endpoint on TCP port 6000 for transmit and its
 publisher endpoint on TCP port 7000 for receive. The interface transports one
