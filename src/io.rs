@@ -214,7 +214,7 @@ pub(crate) async fn send_direct_iface(
     /* Add authentication and checksums only to packets originated here. */
     if from_me {
         /* Append HMAC */
-        if idout.flags.contains(Flags::CSP_FHMAC) {
+        if idout.flags.contains(Flags::HMAC) {
             // Calculate and add HMAC (does not include header for backwards compatibility with csp1.x)
             #[cfg(feature = "hmac")]
             if crate::crypto::hmac::append(&mut packet, false).is_err() {
@@ -230,7 +230,7 @@ pub(crate) async fn send_direct_iface(
         }
 
         /* Append CRC32 */
-        if idout.flags.contains(Flags::CSP_FCRC32) {
+        if idout.flags.contains(Flags::CRC32) {
             /* New CRC32 trailers cover the packed header and payload. */
             if packet.append_crc32().is_err() {
                 /* CRC32 append failed */
@@ -269,7 +269,7 @@ pub(crate) async fn send(conn: &mut Connection, mut packet: Packet) -> Result<()
     }
 
     #[cfg(feature = "rdp")]
-    if conn.idout().flags.contains(Flags::CSP_FRDP) {
+    if conn.idout().flags.contains(Flags::RDP) {
         if let Err(e) = crate::rdp::send(conn, &mut packet).await {
             return Err(e);
         }
@@ -351,24 +351,24 @@ pub(crate) async fn send_to(
     mut packet: Packet,
 ) -> Result<(), Error> {
     // reset flags if not same
-    if !opts.contains(ConnOptions::CSP_O_SAME) {
+    if !opts.contains(ConnOptions::SAME) {
         packet.id.flags = Flags::empty();
     }
 
-    if opts.contains(ConnOptions::CSP_O_RDP) {
+    if opts.contains(ConnOptions::RDP) {
         return Err(Error::InvalidOperation);
     }
 
-    if opts.contains(ConnOptions::CSP_O_HMAC) {
+    if opts.contains(ConnOptions::HMAC) {
         if cfg!(feature = "hmac") {
-            packet.id.flags |= Flags::CSP_FHMAC;
+            packet.id.flags |= Flags::HMAC;
         } else {
             return Err(Error::FeatureDisabled);
         }
     }
 
-    if opts.contains(ConnOptions::CSP_O_CRC32) {
-        packet.id.flags |= Flags::CSP_FCRC32;
+    if opts.contains(ConnOptions::CRC32) {
+        packet.id.flags |= Flags::CRC32;
     }
 
     packet.id.dst = dest;

@@ -246,4 +246,61 @@ impl Socket {
             }
         }
     }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CSP_PORT_MAX_BIND, Port, Socket, SocketOptions, get_socket};
+    use crate::{CSP_ANY, Error};
+    use serial_test::serial;
+    use std::vec;
+
+    #[tokio::test]
+    #[serial]
+    async fn bind_listen_close_and_rebind_socket() {
+        let port = CSP_PORT_MAX_BIND as u8;
+        let mut socket = Socket::new_connectionless();
+        assert!(socket.is_conn_less());
+        socket.bind(port).unwrap();
+
+        let state = get_socket(port).unwrap();
+        assert!(state.is_conn_less());
+        assert!(state.is_ready_to_recieve());
+        assert!(state.options().contains(SocketOptions::CSP_SO_CONN_LESS));
+
+        let mut duplicate = Socket::new();
+        assert_eq!(duplicate.bind(port), Err(Error::PortBusy));
+
+        socket.close().await;
+        assert!(get_socket(port).is_none());
+        duplicate.bind(port).unwrap();
+        duplicate.close().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn connection_oriented_socket_requires_listen() {
+        let port = (CSP_PORT_MAX_BIND - 1) as u8;
+        let mut socket = Socket::new();
+        socket.bind(port).unwrap();
+
+        let state = get_socket(port).unwrap();
+        assert!(!state.is_conn_less());
+        assert!(!state.is_ready_to_recieve());
+        socket.listen(1).unwrap();
+        assert!(state.is_ready_to_recieve());
+
+        socket.close().await;
+    }
+
+    #[test]
+    fn wildcard_port_is_not_a_valid_receive_port() {
+        assert!(get_socket(CSP_ANY).is_none());
+    }
+
+    #[test]
+    fn closed_port_variant_is_not_open() {
+        assert!(!Port::Closed.is_open());
+    }
 }

@@ -82,6 +82,41 @@ impl ConnState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::ConnState;
+
+    #[test]
+    fn connection_state_requires_cleanup_before_reopening() {
+        let state = ConnState::closed();
+        assert!(state.is_closed());
+        assert!(state.try_open());
+        assert!(state.is_open());
+        assert!(!state.try_open());
+
+        state.set_need_drop();
+        assert!(state.is_closed());
+        assert!(!state.try_open());
+
+        assert!(
+            state
+                .0
+                .compare_exchange(
+                    ConnState::NEED_DROP,
+                    ConnState::DROPPING,
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        );
+        assert!(state.is_dropping());
+        assert!(!state.try_open());
+
+        state.set_closed();
+        assert!(state.try_open());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnType {
     Client,
@@ -93,20 +128,20 @@ bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct ConnOptions: u32{
         /// No connection options
-        const CSP_O_NONE = 0x0000;
+        const NONE = 0x0000;
         /// Enable RDP
-        const CSP_O_RDP = 0x0001;
+        const RDP = 0x0001;
         /// Disable RDP
-        const CSP_O_NORDP = 0x0002;
+        const NORDP = 0x0002;
         /// Enable HMAC
-        const CSP_O_HMAC = 0x0004;
+        const HMAC = 0x0004;
         /// Disable HMAC
-        const CSP_O_NOHMAC = 0x0008;
+        const NOHMAC = 0x0008;
         /// Enable CRC32
-        const CSP_O_CRC32 = 0x0040;
+        const CRC32 = 0x0040;
         /// Disable CRC32
-        const CSP_O_NOCRC32 = 0x0080;
-        const CSP_O_SAME = 0x8000;
+        const NOCRC32 = 0x0080;
+        const SAME = 0x8000;
     }
 }
 
@@ -346,25 +381,25 @@ impl Connection {
             dport: dport,
         };
 
-        if opts.contains(ConnOptions::CSP_O_NOCRC32) {
-            opts.remove(ConnOptions::CSP_O_CRC32);
+        if opts.contains(ConnOptions::NOCRC32) {
+            opts.remove(ConnOptions::CRC32);
         }
 
         #[cfg(feature = "rdp")]
-        if opts.contains(ConnOptions::CSP_O_RDP) {
-            incoming_id.flags |= Flags::CSP_FRDP;
-            outgoing_id.flags |= Flags::CSP_FRDP;
+        if opts.contains(ConnOptions::RDP) {
+            incoming_id.flags |= Flags::RDP;
+            outgoing_id.flags |= Flags::RDP;
         }
 
         #[cfg(feature = "hmac")]
-        if opts.contains(ConnOptions::CSP_O_HMAC) {
-            incoming_id.flags |= Flags::CSP_FHMAC;
-            outgoing_id.flags |= Flags::CSP_FHMAC;
+        if opts.contains(ConnOptions::HMAC) {
+            incoming_id.flags |= Flags::HMAC;
+            outgoing_id.flags |= Flags::HMAC;
         }
 
-        if opts.contains(ConnOptions::CSP_O_CRC32) {
-            incoming_id.flags |= Flags::CSP_FCRC32;
-            outgoing_id.flags |= Flags::CSP_FCRC32;
+        if opts.contains(ConnOptions::CRC32) {
+            incoming_id.flags |= Flags::CRC32;
+            outgoing_id.flags |= Flags::CRC32;
         }
 
         let mut conn = match Self::new(incoming_id, outgoing_id, ConnType::Client).await {
@@ -383,7 +418,7 @@ impl Connection {
 
         // Call Transport Layer connect
         #[cfg(feature = "rdp")]
-        if outgoing_id.flags.contains(Flags::CSP_FRDP) {
+        if outgoing_id.flags.contains(Flags::RDP) {
             // If the transport layer has failed to connect
             // deallocate connection structure again and return NULL
             if let Err(e) = crate::rdp::connect(&mut conn).await {
@@ -434,8 +469,8 @@ impl Connection {
         self.inner.rx_queue.close();
 
         #[cfg(feature = "rdp")]
-        if self.inner.idin.flags.contains(Flags::CSP_FRDP)
-            || self.inner.idout.flags.contains(Flags::CSP_FRDP)
+        if self.inner.idin.flags.contains(Flags::RDP)
+            || self.inner.idout.flags.contains(Flags::RDP)
         {
             let _ = crate::rdp::close(self, closed_by).await;
         }
@@ -443,7 +478,7 @@ impl Connection {
         self.flush_rx_queue().await;
 
         #[cfg(feature = "rdp")]
-        if self.inner.idin.flags.contains(Flags::CSP_FRDP) {
+        if self.inner.idin.flags.contains(Flags::RDP) {
             crate::rdp_queue::flush(Some(self.connection_id())).await;
         }
 
@@ -475,7 +510,7 @@ impl Connection {
     }
 
     pub(crate) fn set_fragmented(&mut self) {
-        self.inner.idout.flags |= Flags::CSP_FFRAG;
+        self.inner.idout.flags |= Flags::FRAG;
     }
 
     pub(crate) fn idout(&self) -> &CspId {
@@ -531,8 +566,8 @@ impl Connection {
     pub(crate) fn is_active(&self) -> bool {
         // This is for sure an RDP connection
         #[cfg(feature = "rdp")]
-        if self.inner.idin.flags.contains(Flags::CSP_FRDP)
-            || self.inner.idout.flags.contains(Flags::CSP_FRDP)
+        if self.inner.idin.flags.contains(Flags::RDP)
+            || self.inner.idout.flags.contains(Flags::RDP)
         {
             return crate::rdp::conn_is_active(self);
         }
@@ -545,7 +580,7 @@ impl Connection {
         let mut timeout = timeout;
 
         #[cfg(feature = "rdp")]
-        if self.inner.idin.flags.contains(Flags::CSP_FRDP) {
+        if self.inner.idin.flags.contains(Flags::RDP) {
             timeout = timeout.min(self.inner.rdp.conn_timeout);
         }
 
@@ -566,7 +601,7 @@ impl Connection {
 
         // Packet read could trigger ACK transmission
         #[cfg(feature = "rdp")]
-        if self.inner.idin.flags.contains(Flags::CSP_FRDP) && self.inner.rdp.delayed_acks > 0 {
+        if self.inner.idin.flags.contains(Flags::RDP) && self.inner.rdp.delayed_acks > 0 {
             crate::rdp::check_ack(self).await?;
         }
 

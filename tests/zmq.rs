@@ -58,7 +58,7 @@ async fn zmq_interface_publishes_a_complete_csp_frame() {
                 Priority::Normal,
                 0x2001,
                 20,
-                ConnOptions::CSP_O_NONE,
+                ConnOptions::NONE,
                 b"zmq-frame",
             )
             .await,

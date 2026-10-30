@@ -107,7 +107,7 @@ async fn rdp_stream_connects_and_reports_empty_read_timeout() {
             Priority::Normal,
             0,
             30,
-            ConnOptions::CSP_O_RDP,
+            ConnOptions::RDP,
         ))
         .await
         .unwrap();
@@ -137,7 +137,7 @@ async fn rdp_stream_sends_and_receives_in_both_directions() {
             Priority::Normal,
             0,
             31,
-            ConnOptions::CSP_O_RDP,
+            ConnOptions::RDP,
         ))
         .await
         .unwrap();
@@ -200,7 +200,7 @@ async fn rdp_retransmits_data_after_mock_interface_drops_first_transmission() {
             Priority::Normal,
             REMOTE_ADDR,
             32,
-            ConnOptions::CSP_O_RDP,
+            ConnOptions::RDP,
         ))
         .await
         .unwrap();

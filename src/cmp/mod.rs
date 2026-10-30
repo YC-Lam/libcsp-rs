@@ -221,7 +221,7 @@ pub async fn request(node: u16, timeout: u32, code: u8, message: &mut [u8]) -> R
         Priority::Normal,
         node,
         crate::CSP_CMP,
-        crate::ConnOptions::CSP_O_CRC32,
+        crate::ConnOptions::CRC32,
     )
     .await?;
     let sent = stream.send(&buffer[..message_len + 2]).await?;

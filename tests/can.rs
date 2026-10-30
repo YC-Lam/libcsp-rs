@@ -84,7 +84,7 @@ async fn can_interface_transmits_fragments_and_routes_received_packets() {
                 Priority::High,
                 0x2001,
                 20,
-                ConnOptions::CSP_O_NONE,
+                ConnOptions::NONE,
                 b"12345",
             )
             .await,

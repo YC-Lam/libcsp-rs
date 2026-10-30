@@ -113,6 +113,17 @@ impl From<u8> for SocketPort {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{CSP_ANY, SocketPort};
+
+    #[test]
+    fn socket_port_conversion_preserves_explicit_and_any_ports() {
+        assert_eq!(SocketPort::from(20), SocketPort::Port(20));
+        assert_eq!(SocketPort::from(CSP_ANY), SocketPort::Any);
+    }
+}
+
 pub struct CspStream {
     peer_addr: u16,
     peer_port: u8,

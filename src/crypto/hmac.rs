@@ -288,7 +288,7 @@ mod tests {
         set_key(b"csp test key").unwrap();
         let mut packet = Packet::get().unwrap();
         packet.id.prio = Priority::Normal;
-        packet.id.flags = Flags::CSP_FHMAC;
+        packet.id.flags = Flags::HMAC;
         packet.append_data(b"authenticated payload").unwrap();
         append(&mut packet, false).unwrap();
         assert_eq!(
@@ -307,7 +307,7 @@ mod tests {
     fn verification_strips_hmac_and_trailing_crc() {
         set_key(b"crc hmac key").unwrap();
         let mut packet = Packet::get().unwrap();
-        packet.id.flags = Flags::CSP_FHMAC | Flags::CSP_FCRC32;
+        packet.id.flags = Flags::HMAC | Flags::CRC32;
         packet.append_data(b"authenticated payload").unwrap();
         append(&mut packet, false).unwrap();
         packet.append_crc32().unwrap();

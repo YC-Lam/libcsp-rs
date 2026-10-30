@@ -39,7 +39,7 @@ sequenceDiagram
 
 ### RDP connection
 
-With `ConnOptions::CSP_O_RDP`, CSP establishes the connection on the wire using
+With `ConnOptions::RDP`, CSP establishes the connection on the wire using
 the RDP SYN/SYN-ACK/ACK exchange. Data segments use sequence and acknowledgment
 numbers; the router's regular timeout work handles retransmission and delayed
 ACKs.

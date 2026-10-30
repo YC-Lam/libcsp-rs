@@ -139,7 +139,7 @@ pub async fn ping(node: u16, timeout: u32, payload: &mut [u8]) -> Result<u32, Er
         Priority::Normal,
         node,
         crate::CSP_PING,
-        crate::ConnOptions::CSP_O_CRC32,
+        crate::ConnOptions::CRC32,
     )
     .await?;
     let started = crate::arch::get_ms();
@@ -175,7 +175,7 @@ pub async fn process_list(node: u16, timeout: u32, output: &mut [u8]) -> Result<
         Priority::Normal,
         node,
         crate::CSP_PS,
-        crate::ConnOptions::CSP_O_CRC32,
+        crate::ConnOptions::CRC32,
     )
     .await?;
     // The service expects this marker before returning its process-list payload.
@@ -210,7 +210,7 @@ async fn request_u32(node: u16, port: u8, timeout: u32) -> Result<u32, Error> {
         Priority::Normal,
         node,
         port,
-        crate::ConnOptions::CSP_O_CRC32,
+        crate::ConnOptions::CRC32,
     )
     .await?;
     stream.send(&[]).await?;
@@ -231,7 +231,7 @@ async fn send_magic(node: u16, magic: u32) -> Result<(), Error> {
         node,
         crate::CSP_REBOOT,
         0,
-        crate::ConnOptions::CSP_O_CRC32,
+        crate::ConnOptions::CRC32,
         packet,
     )
     .await
@@ -246,4 +246,31 @@ fn replace_data(packet: &mut Packet, data: &[u8]) -> Result<(), Error> {
     packet.remove_data(old_len);
     packet.append_data(data)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clear_hooks, handle};
+    use crate::{CSP_MEMFREE, CSP_PING, Error, Packet};
+
+    #[tokio::test]
+    async fn ping_is_handled_without_platform_hooks() {
+        clear_hooks();
+        let mut packet = Packet::get().unwrap();
+        packet.id.dport = CSP_PING;
+
+        assert_eq!(handle(&mut packet).await, Ok(Some(true)));
+    }
+
+    #[tokio::test]
+    async fn memory_service_requires_hooks_and_an_empty_request() {
+        clear_hooks();
+        let mut packet = Packet::get().unwrap();
+        packet.id.dport = CSP_MEMFREE;
+
+        assert_eq!(handle(&mut packet).await, Err(Error::FeatureDisabled));
+
+        packet.append_data(b"unexpected").unwrap();
+        assert_eq!(handle(&mut packet).await, Err(Error::InvalidOperation));
+    }
 }

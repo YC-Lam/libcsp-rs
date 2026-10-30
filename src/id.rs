@@ -49,19 +49,19 @@ bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct Flags: u8{
         /// Reserved for future use
-        const CSP_FRES1 = 0x80;
+        const RES1 = 0x80;
         /// Reserved for future use
-        const CSP_FRES2 = 0x40;
+        const RES2 = 0x40;
         /// Reserved for future use
-        const CSP_FRES3 = 0x20;
+        const RES3 = 0x20;
         /// Use fragmentation
-        const CSP_FFRAG = 0x10;
+        const FRAG = 0x10;
         /// Use HMAC verification
-        const CSP_FHMAC = 0x08;
+        const HMAC = 0x08;
         /// Use RDP protocol
-        const CSP_FRDP = 0x02;
+        const RDP = 0x02;
         /// Use CRC32 checksum
-        const CSP_FCRC32 = 0x01;
+        const CRC32 = 0x01;
     }
 }
 

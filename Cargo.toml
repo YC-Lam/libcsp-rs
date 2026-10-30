@@ -49,5 +49,4 @@ zmq = ["std", "dep:zmq"]
 
 [[example]]
 name = "can_stm32"
-target = "thumbv7em-none-eabi"
 required-features = ["embassy_stm32", "embassy-stm32/stm32g431kb", "embassy-executor/executor-thread", "embassy-executor/platform-cortex-m"]

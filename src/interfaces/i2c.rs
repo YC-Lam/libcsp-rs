@@ -200,7 +200,7 @@ mod tests {
         let mut packet = Packet::get().unwrap();
         packet.id = CspId {
             prio: Priority::High,
-            flags: Flags::CSP_FCRC32,
+            flags: Flags::CRC32,
             src: 2,
             dst: 0x123,
             dport: 10,

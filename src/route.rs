@@ -14,14 +14,14 @@ use crate::*;
 fn check_options(iface: &mut InterfacePrivate, packet: &Packet) -> Result<(), Error> {
     /* Drop HMAC packets */
     #[cfg(not(feature = "hmac"))]
-    if (packet.id.flags.contains(Flags::CSP_FHMAC)) {
+    if (packet.id.flags.contains(Flags::HMAC)) {
         iface.autherr += 1;
         return Err(Error::FeatureDisabled);
     }
 
     /* Drop RDP packets */
     #[cfg(not(feature = "rdp"))]
-    if (packet.id.flags.contains(Flags::CSP_FRDP)) {
+    if (packet.id.flags.contains(Flags::RDP)) {
         iface.rx_error += 1;
         return Err(Error::FeatureDisabled);
     }
@@ -41,7 +41,7 @@ fn security_check(
     packet: &mut Packet,
 ) -> Result<(), Error> {
     /* CRC32 verified packet */
-    if packet.id.flags.contains(Flags::CSP_FCRC32) {
+    if packet.id.flags.contains(Flags::CRC32) {
         /* Verify header-inclusive CRC32, accepting legacy payload-only packets. */
         if !packet.verify_crc32() {
             iface.rx_error += 1;
@@ -54,7 +54,7 @@ fn security_check(
 
     /* HMAC authenticated packet */
     #[cfg(feature = "hmac")]
-    if packet.id.flags.contains(Flags::CSP_FHMAC) {
+    if packet.id.flags.contains(Flags::HMAC) {
         /* Verify HMAC (does not include header for backwards compatibility with csp1.x) */
         if crate::crypto::hmac::verify(packet, false).is_err() {
             /* HMAC failed */
@@ -68,7 +68,7 @@ fn security_check(
 
     /* RDP packet */
     #[cfg(feature = "rdp")]
-    if !(packet.id.flags.contains(Flags::CSP_FRDP)) {
+    if !(packet.id.flags.contains(Flags::RDP)) {
         if security_opts.contains(SocketOptions::CSP_SO_RDPREQ) {
             iface.rx_error += 1;
             return Err(Error::InvalidOperation);
@@ -111,12 +111,12 @@ async fn deliver_conn_less(socket: &SocketState, packet: Packet) {
     let _ = socket.rx_queue.push(ConnOrPacket::Packet(packet)).await;
 }
 
-/** 
+/**
  * Deliver the packet to a connection.  The connection is the
  * endpoint: an existing connection, when given, was matched by
  * identifier (client or server side), otherwise the socket acts as
  * the factory for a new server-side connection, which is posted to
- * the socket rx_queue for csp_accept(). 
+ * the socket rx_queue for csp_accept().
  */
 #[allow(unused_mut)]
 async fn deliver_connection(
@@ -153,7 +153,7 @@ async fn deliver_connection(
 
     /* Pass packet to RDP module */
     #[cfg(feature = "rdp")]
-    if packet.id.flags.contains(Flags::CSP_FRDP) {
+    if packet.id.flags.contains(Flags::RDP) {
         let close_connection = crate::rdp::new_packet(&mut conn, socket, packet).await;
         if close_connection {
             conn.close().await;
@@ -170,6 +170,40 @@ async fn deliver_connection(
             conn.set_socket_deliverd(true);
             let _ = socket.rx_queue.push(ConnOrPacket::Connection(conn)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::security_check;
+    use crate::interfaces::InterfacePrivate;
+    use crate::port::SocketOptions;
+    use crate::{Error, Flags, Packet};
+
+    #[test]
+    fn required_crc_is_rejected_when_packet_has_no_crc_flag() {
+        let mut iface = InterfacePrivate::new();
+        let mut packet = Packet::get().unwrap();
+
+        assert_eq!(
+            security_check(SocketOptions::CSP_SO_CRC32REQ, &mut iface, &mut packet),
+            Err(Error::CRC32)
+        );
+        assert_eq!(iface.rx_error, 1);
+    }
+
+    #[test]
+    fn malformed_crc_trailer_is_rejected() {
+        let mut iface = InterfacePrivate::new();
+        let mut packet = Packet::get().unwrap();
+        packet.append_data(b"payload").unwrap();
+        packet.id.flags |= Flags::CRC32;
+
+        assert_eq!(
+            security_check(SocketOptions::empty(), &mut iface, &mut packet),
+            Err(Error::CRC32)
+        );
+        assert_eq!(iface.rx_error, 1);
     }
 }
 

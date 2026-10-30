@@ -399,7 +399,7 @@ mod tests {
         let mut packet = Packet::get().unwrap();
         packet.id = CspId {
             prio: Priority::Normal,
-            flags: Flags::CSP_FCRC32,
+            flags: Flags::CRC32,
             src: 2,
             dst: 1,
             dport: 10,
@@ -441,7 +441,7 @@ mod tests {
         let iface_id = unsafe { crate::add_interface(&mut IFACE) };
         let packet_id = CspId {
             prio: Priority::High,
-            flags: Flags::CSP_FCRC32,
+            flags: Flags::CRC32,
             src: 2,
             dst: 1,
             dport: 10,

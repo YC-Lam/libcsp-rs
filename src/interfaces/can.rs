@@ -429,7 +429,7 @@ mod tests {
         packet.id.dst = 0x123;
         packet.id.dport = 12;
         packet.id.sport = 34;
-        packet.id.flags = Flags::CSP_FCRC32;
+        packet.id.flags = Flags::CRC32;
         packet.append_data(payload).unwrap();
         packet
     }

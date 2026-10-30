@@ -56,3 +56,26 @@ impl Interface for Loopback {
 
     fn start(&mut self, _id: InterfaceID) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{LOOPBACK_ADDR, Loopback};
+    use crate::interfaces::Interface;
+    use crate::{Error, Packet};
+
+    #[test]
+    fn loopback_has_local_identity_and_rejects_transmit() {
+        let mut loopback = Loopback::new();
+        let packet = Packet::get().unwrap();
+
+        assert_eq!(loopback.addr(), LOOPBACK_ADDR);
+        assert_eq!(loopback.name(), "LOOP");
+        assert!(loopback.is_loopback_destination(&packet));
+        assert!(!loopback.is_default());
+        assert_eq!(
+            loopback.next_hop(None, &packet, true),
+            Err(Error::InvalidOperation)
+        );
+        assert_eq!(loopback.alias_add(1), Err(Error::InvalidOperation));
+    }
+}

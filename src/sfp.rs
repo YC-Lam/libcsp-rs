@@ -12,7 +12,7 @@ const RDP_HEADER_SIZE: usize = 5;
 /// Return the largest SFP payload that fits in one packet with these options.
 pub(crate) fn opts_max_mtu(options: ConnOptions) -> u32 {
     let mut overhead = SFP_HEADER_SIZE;
-    if options.contains(ConnOptions::CSP_O_RDP) {
+    if options.contains(ConnOptions::RDP) {
         #[cfg(feature = "rdp")]
         {
             overhead += RDP_HEADER_SIZE;
@@ -22,10 +22,10 @@ pub(crate) fn opts_max_mtu(options: ConnOptions) -> u32 {
             overhead += 5;
         }
     }
-    if options.contains(ConnOptions::CSP_O_CRC32) {
+    if options.contains(ConnOptions::CRC32) {
         overhead += CRC32_SIZE;
     }
-    if options.contains(ConnOptions::CSP_O_HMAC) {
+    if options.contains(ConnOptions::HMAC) {
         overhead += HMAC_SIZE;
     }
     (CSP_BUFFER_SIZE - overhead) as u32
@@ -124,7 +124,7 @@ fn validate_fragment(
     expected_total: Option<u32>,
     max_mtu: u32,
 ) -> Result<(u32, u32, usize), Error> {
-    if !packet.id.flags.contains(Flags::CSP_FFRAG) || packet.data_length() < SFP_HEADER_SIZE {
+    if !packet.id.flags.contains(Flags::FRAG) || packet.data_length() < SFP_HEADER_SIZE {
         return Err(Error::Sfp);
     }
 
@@ -168,14 +168,14 @@ mod tests {
     #[test]
     fn maximum_mtu_accounts_for_all_enabled_options() {
         assert_eq!(opts_max_mtu(ConnOptions::empty()), 248);
-        assert_eq!(opts_max_mtu(ConnOptions::CSP_O_CRC32), 244);
+        assert_eq!(opts_max_mtu(ConnOptions::CRC32), 244);
         assert_eq!(
-            opts_max_mtu(ConnOptions::CSP_O_CRC32 | ConnOptions::CSP_O_RDP),
+            opts_max_mtu(ConnOptions::CRC32 | ConnOptions::RDP),
             239
         );
         assert_eq!(
             opts_max_mtu(
-                ConnOptions::CSP_O_CRC32 | ConnOptions::CSP_O_RDP | ConnOptions::CSP_O_HMAC
+                ConnOptions::CRC32 | ConnOptions::RDP | ConnOptions::HMAC
             ),
             235
         );
@@ -186,7 +186,7 @@ mod tests {
     fn sfp_header_is_big_endian() {
         let mut packet = Packet::get().unwrap();
         packet.id.prio = Priority::Normal;
-        packet.id.flags = Flags::CSP_FFRAG;
+        packet.id.flags = Flags::FRAG;
         packet.append_data(&[1, 2, 3]).unwrap();
         packet.append_data(&5u32.to_be_bytes()).unwrap();
         packet.append_data(&10u32.to_be_bytes()).unwrap();
@@ -222,7 +222,7 @@ mod tests {
     #[serial_test::serial]
     fn receive_validation_checks_offset_total_and_payload_mtu() {
         let mut packet = Packet::get().unwrap();
-        packet.id.flags = Flags::CSP_FFRAG;
+        packet.id.flags = Flags::FRAG;
         packet.append_data(&[1, 2]).unwrap();
         packet.append_data(&0u32.to_be_bytes()).unwrap();
         packet.append_data(&4u32.to_be_bytes()).unwrap();

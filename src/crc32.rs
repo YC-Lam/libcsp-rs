@@ -57,3 +57,20 @@ impl CRC32 {
         return 0;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CRC32;
+    
+    #[test]
+    fn crc32_updates_are_chunk_independent() {
+        let mut whole = CRC32::new();
+        whole.update(b"CSP packet");
+
+        let mut chunks = CRC32::new();
+        chunks.update(b"CSP ");
+        chunks.update(b"packet");
+
+        assert_eq!(whole.finish(), chunks.finish());
+    }
+}

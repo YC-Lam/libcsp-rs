@@ -10,7 +10,7 @@ async fn listener_stream_udp_and_sfp_apis_work_over_loopback() {
     assert_eq!(listener.accept(0).await.err(), Some(Error::Timeout));
 
     // Pump the router explicitly so each loopback send is delivered before the matching read.
-    let mut client = CspStream::connect(Priority::Normal, 0, 20, ConnOptions::CSP_O_NONE)
+    let mut client = CspStream::connect(Priority::Normal, 0, 20, ConnOptions::NONE)
         .await
         .unwrap();
     assert_eq!(client.peer_addr(), 0);
@@ -39,7 +39,7 @@ async fn listener_stream_udp_and_sfp_apis_work_over_loopback() {
     assert_eq!(datagram_sender.local_port(), 22);
     assert_eq!(
         datagram_sender
-            .send_to(Priority::High, 0, 21, ConnOptions::CSP_O_NONE, b"datagram",)
+            .send_to(Priority::High, 0, 21, ConnOptions::NONE, b"datagram",)
             .await,
         Ok(8)
     );
@@ -64,7 +64,7 @@ async fn listener_stream_udp_and_sfp_apis_work_over_loopback() {
     // SFP splits a message into 8-byte chunks and reassembles them at the listener.
     let sfp_listener = SfpListener::bind(23).await.unwrap();
     assert_eq!(sfp_listener.local_port(), csp::SocketPort::Port(23));
-    let mut sfp_client = SfpStream::connect(Priority::Normal, 0, 23, ConnOptions::CSP_O_NONE)
+    let mut sfp_client = SfpStream::connect(Priority::Normal, 0, 23, ConnOptions::NONE)
         .await
         .unwrap();
     assert_eq!(sfp_client.max_mtu().unwrap(), 248);
