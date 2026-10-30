@@ -5,6 +5,12 @@ pub(crate) mod loopback;
 #[cfg(feature = "zmq")]
 pub mod zmq;
 
+pub use can::CanInterface;
+pub use i2c::I2cInterface;
+pub use kiss::KissInterface;
+#[cfg(feature = "zmq")]
+pub use zmq::ZmqInterface;
+
 use core::any::Any;
 use core::future::poll_fn;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
