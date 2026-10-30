@@ -121,15 +121,17 @@ async fn can_rx_task(rx: BufferedCanReceiver, iface: InterfaceID) {
     }
 }
 
-#[cfg(feature = "embassy_stm32_time")]
+//#[cfg(feature = "embassy_stm32_time")]
 fn timestamp_to_ms(timestamp: embassy_time::Instant) -> u32 {
     timestamp.as_millis().min(u32::MAX as u64) as u32
 }
 
+/*
 #[cfg(not(feature = "embassy_stm32_time"))]
 fn timestamp_to_ms(timestamp: u16) -> u32 {
     timestamp as u32
 }
+*/
 
 #[cfg(test)]
 mod tests {
