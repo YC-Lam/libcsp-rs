@@ -1,13 +1,14 @@
 #![cfg(feature = "rdp")]
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use csp::interfaces::can::{CanInterface, CanInterfaceDriver};
 use csp::interfaces::InterfaceID;
-use csp::{add_interface, ConnOptions, CspListener, CspStream, Error, Packet, Priority};
+use csp::interfaces::can::{CanInterface, CanInterfaceDriver};
+use csp::{ConnOptions, CspListener, CspStream, Error, Packet, Priority, add_interface};
+use serial_test::serial;
 use static_cell::StaticCell;
 use tokio::sync::mpsc;
 
@@ -97,6 +98,7 @@ async fn drive_router<T>(future: impl core::future::Future<Output = T>) -> T {
 }
 
 #[tokio::test]
+#[serial]
 async fn rdp_stream_connects_and_reports_empty_read_timeout() {
     let listener = CspListener::bind(30).await.unwrap();
 
@@ -125,6 +127,7 @@ async fn rdp_stream_connects_and_reports_empty_read_timeout() {
 }
 
 #[tokio::test]
+#[serial]
 async fn rdp_stream_sends_and_receives_in_both_directions() {
     let listener = CspListener::bind(31).await.unwrap();
 
@@ -167,6 +170,7 @@ async fn rdp_stream_sends_and_receives_in_both_directions() {
 }
 
 #[tokio::test]
+#[serial]
 async fn rdp_retransmits_data_after_mock_interface_drops_first_transmission() {
     static INTERFACE: StaticCell<CanInterface<LossyCanDriver>> = StaticCell::new();
 

@@ -42,7 +42,7 @@ fn security_check(
 ) -> Result<(), Error> {
     /* CRC32 verified packet */
     if packet.id.flags.contains(Flags::CSP_FCRC32) {
-        /* Verify CRC32 (does not include header for backwards compatibility with csp1.x) */
+        /* Verify header-inclusive CRC32, accepting legacy payload-only packets. */
         if !packet.verify_crc32() {
             iface.rx_error += 1;
             return Err(Error::CRC32);
@@ -170,6 +170,10 @@ async fn deliver_connection(
     }
 }
 
+/// Process the next packet from the CSP input queue.
+///
+/// Run this repeatedly as the router task; it also checks RDP timeouts before
+/// waiting for the next packet.
 pub async fn route_work() {
     /* Check connection timeouts (currently only for RDP) */
     if cfg!(feature = "rdp") {
@@ -196,8 +200,9 @@ pub async fn route_work() {
 
     /* The packet is to me, if the address matches that of any interface,
      * or the address matches the broadcast address of the incoming interface */
-    let is_to_me = crate::interfaces::get_interface_by_addr(packet.id.dst).is_some()
-        || crate::id::is_broadcast(packet.id.dst, iface.addr(), iface.netmask());
+    let is_broadcast = crate::id::is_broadcast(packet.id.dst, iface.addr(), iface.netmask());
+    let is_to_me =
+        crate::interfaces::get_interface_by_addr(packet.id.dst).is_some() || is_broadcast;
     //todo: || csp_addr_is_alias(packet.id.dst);
 
     /* Deduplication */
@@ -228,6 +233,49 @@ pub async fn route_work() {
     /* Discard packets with unsupported options */
     if check_options(iface, &packet).is_err() {
         return;
+    }
+
+    if matches!(
+        packet.id.dport,
+        crate::CSP_CMP
+            | crate::CSP_PING
+            | crate::CSP_PS
+            | crate::CSP_MEMFREE
+            | crate::CSP_REBOOT
+            | crate::CSP_BUF_FREE
+            | crate::CSP_UPTIME
+    ) {
+        // Built-in services require CRC32 before their handlers are invoked.
+        if let Err(error) = security_check(SocketOptions::CSP_SO_CRC32REQ, iface, &mut packet) {
+            #[cfg(feature = "defmt")]
+            defmt::debug!("CSP service packet security check failed: {:?}", error);
+            #[cfg(not(feature = "defmt"))]
+            let _ = error;
+            return;
+        }
+    }
+
+    match crate::services::handle(&mut packet).await {
+        Ok(Some(true)) => {
+            // The handler has replaced the request payload with its response.
+            if let Err(error) = crate::io::send_service_reply(packet, is_broadcast).await {
+                #[cfg(feature = "defmt")]
+                defmt::warn!("CSP service reply failed: {:?}", error);
+                #[cfg(not(feature = "defmt"))]
+                let _ = error;
+            }
+            return;
+        }
+        // One-way services (reboot/shutdown) consume the request without replying.
+        Ok(Some(false)) => return,
+        Ok(None) => {}
+        Err(error) => {
+            #[cfg(feature = "defmt")]
+            defmt::debug!("CSP service request rejected: {:?}", error);
+            #[cfg(not(feature = "defmt"))]
+            let _ = error;
+            return;
+        }
     }
 
     /* Callback delivery */

@@ -1,5 +1,6 @@
 pub mod can;
 pub mod i2c;
+pub mod kiss;
 pub(crate) mod loopback;
 #[cfg(feature = "zmq")]
 pub mod zmq;
@@ -44,20 +45,6 @@ pub(crate) fn get_interface_by_id(id: InterfaceID) -> Option<&'static mut dyn In
     return None;
 }
 
-fn get_interface_by_subnet(addr: u16) -> Option<&'static mut dyn Interface> {
-    // loop through interfaces
-    for iface in INTERFACES.get_or_init() {
-        // make sure netmask is not zero
-        if iface.netmask() != 0 {
-            if iface.is_within_subnet(addr) {
-                return Some(iface.inner());
-            }
-        }
-    }
-
-    return None;
-}
-
 fn get_interface_by_isdfl() -> Option<&'static mut dyn Interface> {
     // loop through interfaces
     for iface in INTERFACES.get_or_init() {
@@ -69,7 +56,7 @@ fn get_interface_by_isdfl() -> Option<&'static mut dyn Interface> {
     return None;
 }
 
-pub(crate) fn check_dfl() {
+pub fn check_dfl() {
     // If we find a default interface,
     // we assume user has setup the configuration correctly
     if get_interface_by_isdfl().is_some() {
@@ -96,34 +83,48 @@ pub(crate) fn get_interface_by_addr(addr: u16) -> Option<&'static mut dyn Interf
     return None;
 }
 
-fn get_interface_by_broadcast(addr: u16) -> Option<&'static mut dyn Interface> {
+pub(crate) fn interface_id_by_name(name: &[u8]) -> Option<InterfaceID> {
     for iface in INTERFACES.get_or_init() {
-        if crate::id::is_broadcast(addr, iface.addr(), iface.netmask()) {
-            return Some(iface.inner());
+        if iface.name().as_bytes() == name {
+            return Some(iface.id());
         }
     }
 
     return None;
 }
 
-fn get_interface_by_name(name: &str) -> Option<&'static mut dyn Interface> {
-    for iface in INTERFACES.get_or_init() {
-        if iface.name() == name {
-            return Some(iface.inner());
-        }
-    }
-
-    return None;
+pub(crate) struct InterfaceStats {
+    pub tx: u32,
+    pub rx: u32,
+    pub tx_error: u32,
+    pub rx_error: u32,
+    pub drop: u32,
+    pub autherr: u32,
+    pub frame: u32,
+    pub txbytes: u32,
+    pub rxbytes: u32,
+    pub irq: u32,
 }
 
-fn get_interface_by_index(idx: usize) -> Option<&'static mut dyn Interface> {
-    for (i, iface) in INTERFACES.get_or_init().into_iter().enumerate() {
-        if i == idx {
-            return Some(iface.inner());
+pub(crate) fn interface_stats(name: &[u8]) -> Option<InterfaceStats> {
+    for iface in INTERFACES.get_or_init() {
+        if iface.name().as_bytes() == name {
+            return Some(InterfaceStats {
+                tx: iface.tx,
+                rx: iface.rx,
+                tx_error: iface.tx_error,
+                rx_error: iface.rx_error,
+                drop: iface.drop,
+                autherr: iface.autherr,
+                frame: iface.frame,
+                txbytes: iface.txbytes,
+                rxbytes: iface.rxbytes,
+                irq: iface.irq,
+            });
         }
     }
 
-    return None;
+    None
 }
 
 pub fn print_interface_list(writer: &mut impl core::fmt::Write) -> core::fmt::Result {
@@ -181,6 +182,13 @@ pub fn print_interface_list(writer: &mut impl core::fmt::Write) -> core::fmt::Re
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterfaceID(usize);
+
+#[cfg(all(test, feature = "rtable"))]
+impl InterfaceID {
+    pub(crate) const fn from_raw(id: usize) -> Self {
+        Self(id)
+    }
+}
 
 pub trait Interface: Send + Sync + Any {
     fn start(&mut self, _id: InterfaceID) {}
@@ -340,14 +348,9 @@ impl InterfacePrivate {
 
     /// check if interface is within address subnet
     pub(crate) fn is_within_subnet(&self, addr: u16) -> bool {
-        // calculate netmask
-        let netmask =
-            ((1 << self.netmask()) - 1) << (crate::id::get_host_bits() as u16 - self.netmask());
-
-        let network_a = self.addr() & netmask;
-        let network_b = addr & netmask;
-
-        return network_a == network_b;
+        // Netmask values are prefix lengths in the 14-bit CSP node address.
+        let network_mask = crate::id::address_mask(self.netmask() as usize);
+        (self.addr() & network_mask) == (addr & network_mask)
     }
 
     pub(crate) async fn next_hop(
@@ -506,6 +509,8 @@ impl Iterator for IfListIterator {
 }
 
 /// Used to represent an alias reception address, bound to a particular interface
+/// todo
+#[allow(unused)]
 pub(crate) struct AliasAddr {
     pub addr: u16,
     pub iface: &'static dyn Interface,
@@ -605,11 +610,8 @@ mod tests {
         INTERFACES.get_or_init().clear();
 
         assert!(get_interface_by_addr(1).is_none());
-        assert!(get_interface_by_subnet(1).is_none());
-        assert!(get_interface_by_broadcast(1).is_none());
-        assert!(get_interface_by_name("eth0").is_none());
+        assert!(interface_id_by_name(b"eth0").is_none());
         assert_eq!(get_interface_by_addr(0).unwrap().name(), "LOOP");
-        assert!(get_interface_by_index(0).is_some());
         assert!(get_interface_by_isdfl().is_none());
     }
 

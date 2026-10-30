@@ -1,15 +1,8 @@
-use bitflags::bitflags;
+//! CSP 2.x uses a 48-bit network-order header: priority (2 bits), destination
+//! and source node IDs (14 bits each), destination and source ports (6 bits
+//! each), then 6 flag bits.
 
-/**
- * CSP 2.x
- *
- * +--------+-----------------------------------+-----------------------------------------+---------------------+-------------------+----------------------+
- * |        |                                   |                                         |                     |                   |                      |
- * | 2 PRIO |      14 DESTINATION               |       14 SOURCE                         | 6 DESTINATION PORT  | 6 SOURCE PORT     | 6 FLAGS              |
- * |        |                                   |                                         |                     |                   |                      |
- * +--------+-----------------------------------+-----------------------------------------+---------------------+-------------------+----------------------+
- *
- */
+use bitflags::bitflags;
 
 const CSP_ID2_HOST_SIZE: usize = 14;
 const CSP_ID2_PORT_SIZE: usize = 6;
@@ -85,8 +78,9 @@ pub(crate) struct CspId {
 }
 
 impl CspId {
+    /// Encode the identifier as the six-byte CSP 2.x network header.
     pub(crate) fn to_header(&self) -> [u8; CSP_ID2_HEADER_SIZE] {
-        // Pack into 64-bit using host endian
+        // Pack the fields into the low 48 bits before serializing in network order.
         let mut id2: u64 = ((self.prio as u64) << CSP_ID2_PRIO_OFFSET)
             | ((self.dst as u64) << CSP_ID2_DST_OFFSET)
             | ((self.src as u64) << CSP_ID2_SRC_OFFSET)
@@ -94,15 +88,18 @@ impl CspId {
             | ((self.sport as u64) << CSP_ID2_SPORT_OFFSET)
             | ((self.flags.bits() as u64) << CSP_ID2_FLAGS_OFFSET);
 
-        // We first shift up the 48 bit header to most significant end of the 64-bit
+        // Shift the 48-bit header into the most significant end of the word.
         id2 = id2 << 16;
 
-        //Convert to big / network endian
+        // Convert to big / network endian.
         let data = id2.to_be_bytes();
 
         return [data[0], data[1], data[2], data[3], data[4], data[5]];
     }
 
+    /// Decode a six-byte CSP 2.x network header.
+    ///
+    /// Callers must validate the input length before calling this method.
     pub(crate) fn from_header(header: &[u8]) -> Self {
         let id2 = u64::from_be_bytes([
             header[0], header[1], header[2], header[3], header[4], header[5], 0, 0,
@@ -142,17 +139,54 @@ pub const fn get_max_port() -> usize {
     (1 << CSP_ID2_PORT_SIZE) - 1
 }
 
+/// Return the 14-bit network mask for a prefix length, clamped to CSP's
+/// address width.
+pub(crate) const fn address_mask(prefix_len: usize) -> u16 {
+    let prefix_len = if prefix_len > CSP_ID2_HOST_SIZE {
+        CSP_ID2_HOST_SIZE
+    } else {
+        prefix_len
+    };
+    if prefix_len == 0 {
+        0
+    } else {
+        (((1u32 << prefix_len) - 1) << (CSP_ID2_HOST_SIZE - prefix_len)) as u16
+    }
+}
+
+/// Check whether `addr` is the all-ones host address for an interface subnet,
+/// or CSP's global all-ones node address.
+///
+/// The prefix length is limited to the 14-bit node address width. A full-width
+/// prefix has no host bits, so only the global broadcast address applies.
 pub fn is_broadcast(addr: u16, iface_addr: u16, iface_netmask: u16) -> bool {
-    let hostmask: u16 = (1 << get_host_bits() as u16 - iface_netmask) - 1;
-    let netmask: u16 = (1 << get_host_bits()) - 1 - hostmask;
-
-    if (addr & hostmask) == hostmask && (addr & netmask) == (iface_addr & netmask) {
-        return true;
+    let prefix_len = (iface_netmask as usize).min(CSP_ID2_HOST_SIZE);
+    if prefix_len == CSP_ID2_HOST_SIZE {
+        return addr == get_max_nodeid();
     }
 
-    if addr == get_max_nodeid() as u16 {
-        return true;
+    let network_mask = address_mask(prefix_len);
+    let hostmask = get_max_nodeid() ^ network_mask;
+    ((addr & hostmask) == hostmask && (addr & network_mask) == (iface_addr & network_mask))
+        || addr == get_max_nodeid()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_width_subnet_does_not_broadcast_its_interface_address() {
+        assert!(!is_broadcast(0x1234, 0x1234, 14));
+        assert!(is_broadcast(get_max_nodeid(), 0x1234, 14));
+        assert!(!is_broadcast(0x1234, 0x1234, u16::MAX));
     }
 
-    return false;
+    #[test]
+    fn subnet_broadcast_matches_only_its_network() {
+        assert!(!is_broadcast(0x2000, 0x2000, 13));
+        assert!(is_broadcast(0x2001, 0x2000, 13));
+        assert!(!is_broadcast(0x2001, 0x2002, 13));
+        assert!(is_broadcast(get_max_nodeid(), 0x2000, 13));
+    }
 }

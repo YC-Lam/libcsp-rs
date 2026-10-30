@@ -14,6 +14,6 @@ bind_interrupts!(struct Irqs {
 });
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner){
+async fn main(_spawner: Spawner) {
     
 }

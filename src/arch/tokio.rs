@@ -79,41 +79,6 @@ pub fn get_seconds() -> u32 {
     get_ms() / 1000
 }
 
-pub struct Mutex<T> {
-    inner: tokio::sync::Mutex<T>,
-}
-
-impl<T> Mutex<T> {
-    pub const fn new(value: T) -> Self {
-        Self {
-            inner: tokio::sync::Mutex::const_new(value),
-        }
-    }
-
-    pub async fn lock<'a>(&'a self) -> MutexGuard<'a, T> {
-        MutexGuard {
-            inner: self.inner.lock().await,
-        }
-    }
-}
-
-pub struct MutexGuard<'a, T> {
-    inner: tokio::sync::MutexGuard<'a, T>,
-}
-
-impl<'a, T> core::ops::Deref for MutexGuard<'a, T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<'a, T> core::ops::DerefMut for MutexGuard<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
 pub struct Queue<T, const N: usize> {
     inner: super::LazyLock<(smol::channel::Sender<T>, smol::channel::Receiver<T>)>,
 }
@@ -161,12 +126,12 @@ impl<T, const N: usize> Queue<T, N> {
     }
 }
 
-pub struct Semaphore<const N: usize> {
+pub struct Semaphore {
     available: AtomicBool,
     notify: tokio::sync::Notify,
 }
 
-impl<const N: usize> Semaphore<N> {
+impl Semaphore {
     /// Equivalent to csp_bin_sem_init(): initially unlocked.
     pub const fn new() -> Self {
         Self {
@@ -225,7 +190,7 @@ mod tests {
 
     #[tokio::test]
     async fn semaphore_wait_consumes_and_post_releases_a_single_permit() {
-        let semaphore = Semaphore::<1>::new();
+        let semaphore = Semaphore::new();
 
         assert_eq!(semaphore.wait(0).await, Ok(()));
         assert_eq!(semaphore.wait(0).await, Err(Error::Timeout));

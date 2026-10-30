@@ -1,518 +1,376 @@
-//! CSP Management Protocol (CMP).
+//! CSP Management Protocol (CMP) requests and response handling.
+//!
+//! Typed helpers encode multi-byte fields in network byte order. The generic
+//! [`request`] API accepts only the payload; it adds and validates the CMP header.
 
-use core::ffi::c_void;
+use crate::{CspStream, Error, Priority};
 
-// Replace these with the values from your CSP configuration.
-pub(crate) const CSP_HOSTNAME_LEN: usize = 16;
-pub(crate) const CSP_MODEL_LEN: usize = 16;
+pub const IDENT_REV_LEN: usize = 20;
+pub const IDENT_DATE_LEN: usize = 12;
+pub const IDENT_TIME_LEN: usize = 9;
+pub const ROUTE_IFACE_LEN: usize = 11;
+pub const IDENT_HOSTNAME_LEN: usize = 16;
+pub const IDENT_MODEL_LEN: usize = 16;
 
-// Replace this alias with the actual type of csp_timestamp_t.
-pub(crate) type CspTimestamp = u64;
+pub const IDENT: u8 = 1;
+pub const ROUTE_SET_V1: u8 = 2;
+pub const IF_STATS: u8 = 3;
+pub const PEEK: u8 = 4;
+pub const POKE: u8 = 5;
+pub const CLOCK: u8 = 6;
+pub const ROUTE_SET_V2: u8 = 7;
+pub const PEEK_V2: u8 = 8;
+pub const POKE_V2: u8 = 9;
 
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
+// CMP messages begin with a type byte followed by a request code.
+const REQUEST: u8 = 0;
+const REPLY: u8 = 0xff;
+const MAX_CMP_MSG: usize = crate::buffer::CSP_BUFFER_SIZE;
+const MAX_CMP_REQUEST: usize = MAX_CMP_MSG - 4;
+const IDENT_MSG_LEN: usize =
+    2 + IDENT_HOSTNAME_LEN + IDENT_MODEL_LEN + IDENT_REV_LEN + IDENT_DATE_LEN + IDENT_TIME_LEN;
+const IF_STATS_PAYLOAD_LEN: usize = ROUTE_IFACE_LEN + 10 * 4;
 
-pub(crate) const CSP_CMP_IDENT_REV_LEN: usize = 20;
-pub(crate) const CSP_CMP_IDENT_DATE_LEN: usize = 12;
-pub(crate) const CSP_CMP_IDENT_TIME_LEN: usize = 9;
+/// Fixed-width identification strings returned by the CMP IDENT request.
+///
+/// The byte arrays use the lengths defined by the CMP wire format and may
+/// contain NUL padding.
+#[derive(Clone, Copy)]
+pub struct Identity {
+    pub hostname: [u8; IDENT_HOSTNAME_LEN],
+    pub model: [u8; IDENT_MODEL_LEN],
+    pub revision: [u8; IDENT_REV_LEN],
+    pub date: [u8; IDENT_DATE_LEN],
+    pub time: [u8; IDENT_TIME_LEN],
+}
 
-pub(crate) const CSP_CMP_ROUTE_IFACE_LEN: usize = 11;
-
-pub(crate) const CSP_CMP_PEEK_MAX_LEN: usize = 200;
-pub(crate) const CSP_CMP_POKE_MAX_LEN: usize = 200;
-pub(crate) const CSP_CMP_PEEK_V2_MAX_LEN: usize = 196;
-pub(crate) const CSP_CMP_POKE_V2_MAX_LEN: usize = 196;
-
-// -----------------------------------------------------------------------------
-// Enumerations
-// -----------------------------------------------------------------------------
-
-#[repr(u8)]
+/// Interface counters returned by the CMP IF_STATS request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CspCmpType {
-    Request = 0x00,
-    Reply = 0xff,
+pub struct InterfaceStats {
+    pub tx: u32,
+    pub rx: u32,
+    pub tx_error: u32,
+    pub rx_error: u32,
+    pub drop: u32,
+    pub autherr: u32,
+    pub frame: u32,
+    pub txbytes: u32,
+    pub rxbytes: u32,
+    pub irq: u32,
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CspCmpCode {
-    Ident = 1,
-    RouteSetV1 = 2,
-    IfStats = 3,
-    Peek = 4,
-    Poke = 5,
-    Clock = 6,
-    RouteSetV2 = 7,
-    PeekV2 = 8,
-    PokeV2 = 9,
+impl Identity {
+    /// Create an identity containing only zero bytes.
+    pub const fn empty() -> Self {
+        Self {
+            hostname: [0; IDENT_HOSTNAME_LEN],
+            model: [0; IDENT_MODEL_LEN],
+            revision: [0; IDENT_REV_LEN],
+            date: [0; IDENT_DATE_LEN],
+            time: [0; IDENT_TIME_LEN],
+        }
+    }
+
+    /// Create an identity from its fixed-width wire-format fields.
+    pub const fn new(
+        hostname: [u8; IDENT_HOSTNAME_LEN],
+        model: [u8; IDENT_MODEL_LEN],
+        revision: [u8; IDENT_REV_LEN],
+        date: [u8; IDENT_DATE_LEN],
+        time: [u8; IDENT_TIME_LEN],
+    ) -> Self {
+        Self {
+            hostname,
+            model,
+            revision,
+            date,
+            time,
+        }
+    }
 }
 
-// -----------------------------------------------------------------------------
-// Wire message headers
-// -----------------------------------------------------------------------------
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpHeader {
-    pub(crate) type_: u8,
-    pub(crate) code: u8,
+/// Request the remote node's fixed-width identification fields.
+pub async fn get_identity(node: u16, timeout: u32) -> Result<Identity, Error> {
+    let mut payload = [0; IDENT_MSG_LEN - 2];
+    request(node, timeout, IDENT, &mut payload).await?;
+    let mut offset = 0;
+    let mut hostname = [0; IDENT_HOSTNAME_LEN];
+    hostname.copy_from_slice(&payload[offset..offset + IDENT_HOSTNAME_LEN]);
+    offset += IDENT_HOSTNAME_LEN;
+    let mut model = [0; IDENT_MODEL_LEN];
+    model.copy_from_slice(&payload[offset..offset + IDENT_MODEL_LEN]);
+    offset += IDENT_MODEL_LEN;
+    let mut revision = [0; IDENT_REV_LEN];
+    revision.copy_from_slice(&payload[offset..offset + IDENT_REV_LEN]);
+    offset += IDENT_REV_LEN;
+    let mut date = [0; IDENT_DATE_LEN];
+    date.copy_from_slice(&payload[offset..offset + IDENT_DATE_LEN]);
+    offset += IDENT_DATE_LEN;
+    let mut time = [0; IDENT_TIME_LEN];
+    time.copy_from_slice(&payload[offset..offset + IDENT_TIME_LEN]);
+    Ok(Identity::new(hostname, model, revision, date, time))
 }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpIdentMsg {
-    pub(crate) type_: u8,
-    pub(crate) code: u8,
-    pub(crate) hostname: [u8; CSP_HOSTNAME_LEN],
-    pub(crate) model: [u8; CSP_MODEL_LEN],
-    pub(crate) revision: [u8; CSP_CMP_IDENT_REV_LEN],
-    pub(crate) date: [u8; CSP_CMP_IDENT_DATE_LEN],
-    pub(crate) time: [u8; CSP_CMP_IDENT_TIME_LEN],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpRouteSetV1Msg {
-    pub(crate) type_: u8,
-    pub(crate) code: u8,
-    pub(crate) dest_node: u8,
-    pub(crate) next_hop_via: u8,
-    pub(crate) interface: [u8; CSP_CMP_ROUTE_IFACE_LEN],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpRouteSetV2Msg {
-    pub(crate) type_: u8,
-    pub(crate) code: u8,
-    pub(crate) dest_node: u16,
-    pub(crate) next_hop_via: u16,
-    pub(crate) netmask: u16,
-    pub(crate) interface: [u8; CSP_CMP_ROUTE_IFACE_LEN],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpIfStatsMsg {
-    pub(crate) type_: u8,
-    pub(crate) code: u8,
-    pub(crate) interface: [u8; CSP_CMP_ROUTE_IFACE_LEN],
-    pub(crate) tx: u32,
-    pub(crate) rx: u32,
-    pub(crate) tx_error: u32,
-    pub(crate) rx_error: u32,
-    pub(crate) drop: u32,
-    pub(crate) autherr: u32,
-    pub(crate) frame: u32,
-    pub(crate) txbytes: u32,
-    pub(crate) rxbytes: u32,
-    pub(crate) irq: u32,
-}
-
-// Flexible-array messages: these structs describe only the fixed prefix.
-// The trailing data bytes follow immediately after the prefix on the wire.
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpPeekMsg {
-    pub(crate) type_: u8,
-    pub(crate) code: u8,
-    pub(crate) addr: u32,
-    pub(crate) len: u8,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpPokeMsg {
-    pub(crate) type_: u8,
-    pub(crate) code: u8,
-    pub(crate) addr: u32,
-    pub(crate) len: u8,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpPeekV2Msg {
-    pub(crate) type_: u8,
-    pub(crate) code: u8,
-    pub(crate) vaddr: u64,
-    pub(crate) len: u8,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpPokeV2Msg {
-    pub(crate) type_: u8,
-    pub(crate) code: u8,
-    pub(crate) vaddr: u64,
-    pub(crate) len: u8,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpClockMsg {
-    pub(crate) type_: u8,
-    pub(crate) code: u8,
-    pub(crate) clock: CspTimestamp,
-}
-
-// -----------------------------------------------------------------------------
-// Legacy aggregate message
-// -----------------------------------------------------------------------------
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpIdent {
-    pub(crate) hostname: [u8; CSP_HOSTNAME_LEN],
-    pub(crate) model: [u8; CSP_MODEL_LEN],
-    pub(crate) revision: [u8; CSP_CMP_IDENT_REV_LEN],
-    pub(crate) date: [u8; CSP_CMP_IDENT_DATE_LEN],
-    pub(crate) time: [u8; CSP_CMP_IDENT_TIME_LEN],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpRouteSetV1 {
-    pub(crate) dest_node: u8,
-    pub(crate) next_hop_via: u8,
-    pub(crate) interface: [u8; CSP_CMP_ROUTE_IFACE_LEN],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpRouteSetV2 {
-    pub(crate) dest_node: u16,
-    pub(crate) next_hop_via: u16,
-    pub(crate) netmask: u16,
-    pub(crate) interface: [u8; CSP_CMP_ROUTE_IFACE_LEN],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpIfStats {
-    pub(crate) interface: [u8; CSP_CMP_ROUTE_IFACE_LEN],
-    pub(crate) tx: u32,
-    pub(crate) rx: u32,
-    pub(crate) tx_error: u32,
-    pub(crate) rx_error: u32,
-    pub(crate) drop: u32,
-    pub(crate) autherr: u32,
-    pub(crate) frame: u32,
-    pub(crate) txbytes: u32,
-    pub(crate) rxbytes: u32,
-    pub(crate) irq: u32,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpPeek {
-    pub(crate) addr: u32,
-    pub(crate) len: u8,
-    pub(crate) data: [u8; CSP_CMP_PEEK_MAX_LEN],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpPoke {
-    pub(crate) addr: u32,
-    pub(crate) len: u8,
-    pub(crate) data: [u8; CSP_CMP_POKE_MAX_LEN],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpPeekV2 {
-    pub(crate) vaddr: u64,
-    pub(crate) len: u8,
-    pub(crate) data: [u8; CSP_CMP_PEEK_V2_MAX_LEN],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpPokeV2 {
-    pub(crate) vaddr: u64,
-    pub(crate) len: u8,
-    pub(crate) data: [u8; CSP_CMP_POKE_V2_MAX_LEN],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) union CspCmpPayload {
-    pub(crate) ident: CspCmpIdent,
-    pub(crate) route_set_v1: CspCmpRouteSetV1,
-    pub(crate) route_set_v2: CspCmpRouteSetV2,
-    pub(crate) if_stats: CspCmpIfStats,
-    pub(crate) peek: CspCmpPeek,
-    pub(crate) poke: CspCmpPoke,
-    pub(crate) peek_v2: CspCmpPeekV2,
-    pub(crate) poke_v2: CspCmpPokeV2,
-    pub(crate) clock: CspTimestamp,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) struct CspCmpMessage {
-    pub(crate) type_: u8,
-    pub(crate) code: u8,
-    pub(crate) payload: CspCmpPayload,
-}
-
-// -----------------------------------------------------------------------------
-// Message size calculations
-// -----------------------------------------------------------------------------
-
-#[inline]
-pub(crate) const fn cmp_align_up_32(len: usize) -> usize {
-    (len + 3) & !3
-}
-
-/// Equivalent to CMP_VARIABLE_SIZE for a flexible-array message.
-///
-/// `struct_size` includes the fixed prefix but not the data array.
-/// `fixed_payload_size` is the size of the prefix after the 2-byte header.
-#[inline]
-pub(crate) const fn cmp_variable_size(
-    struct_size: usize,
-    fixed_payload_size: usize,
-    len: usize,
-) -> usize {
-    let tail_size = cmp_align_up_32(fixed_payload_size)
-        - fixed_payload_size;
-
-    struct_size + tail_size + len
-}
-
-pub(crate) const fn cmp_peek_size(len: usize) -> usize {
-    cmp_variable_size(7, 5, len)
-}
-
-pub(crate) const fn cmp_poke_size(len: usize) -> usize {
-    cmp_variable_size(7, 5, len)
-}
-
-pub(crate) const fn cmp_peek_v2_size(len: usize) -> usize {
-    cmp_variable_size(11, 9, len)
-}
-
-pub(crate) const fn cmp_poke_v2_size(len: usize) -> usize {
-    cmp_variable_size(11, 9, len)
-}
-
-// -----------------------------------------------------------------------------
-// FFI
-// -----------------------------------------------------------------------------
-
-unsafe extern "C" {
-    pub(crate) fn csp_cmp(
-        node: u16,
-        timeout: u32,
-        code: u8,
-        msg_size: i32,
-        msg: *mut c_void,
-    ) -> i32;
-}
-
-// -----------------------------------------------------------------------------
-// Safe-size, unsafe-call wrappers
-// -----------------------------------------------------------------------------
-
-/// Sends a CMP request using the specified fixed-size message.
-///
-/// # Safety
-///
-/// `msg` must point to a writable buffer of at least `msg_size` bytes.
-/// The buffer must remain valid for the duration of the C call.
-pub(crate) unsafe fn cmp(
+/// Request counters for an interface identified by its ASCII name.
+pub async fn get_interface_stats(
     node: u16,
     timeout: u32,
-    code: CspCmpCode,
-    msg_size: usize,
-    msg: *mut c_void,
-) -> i32 {
-    let Ok(msg_size) = i32::try_from(msg_size) else {
-        return -1;
+    interface: &str,
+) -> Result<InterfaceStats, Error> {
+    if interface.len() >= ROUTE_IFACE_LEN || !interface.is_ascii() {
+        return Err(Error::InvalidOperation);
+    }
+
+    let mut payload = [0; IF_STATS_PAYLOAD_LEN];
+    payload[..interface.len()].copy_from_slice(interface.as_bytes());
+    request(node, timeout, IF_STATS, &mut payload).await?;
+    let mut fields = [0; 10];
+    for (index, field) in fields.iter_mut().enumerate() {
+        let start = ROUTE_IFACE_LEN + index * 4;
+        *field = u32::from_be_bytes(payload[start..start + 4].try_into().unwrap());
+    }
+    Ok(InterfaceStats {
+        tx: fields[0],
+        rx: fields[1],
+        tx_error: fields[2],
+        rx_error: fields[3],
+        drop: fields[4],
+        autherr: fields[5],
+        frame: fields[6],
+        txbytes: fields[7],
+        rxbytes: fields[8],
+        irq: fields[9],
+    })
+}
+
+/// Install a version-1 route, using the local node's configured host-bit width.
+pub async fn set_route_v1(
+    node: u16,
+    timeout: u32,
+    address: u8,
+    via: Option<u8>,
+    interface: &str,
+) -> Result<(), Error> {
+    if interface.len() >= ROUTE_IFACE_LEN || !interface.is_ascii() {
+        return Err(Error::InvalidOperation);
+    }
+    let mut payload = [0; 2 + ROUTE_IFACE_LEN];
+    payload[0] = address;
+    payload[1] = via.unwrap_or(u8::MAX);
+    payload[2..2 + interface.len()].copy_from_slice(interface.as_bytes());
+    request(node, timeout, ROUTE_SET_V1, &mut payload).await
+}
+
+/// Install a version-2 route with an explicit address mask.
+pub async fn set_route_v2(
+    node: u16,
+    timeout: u32,
+    address: u16,
+    netmask: u16,
+    via: Option<u16>,
+    interface: &str,
+) -> Result<(), Error> {
+    if interface.len() >= ROUTE_IFACE_LEN || !interface.is_ascii() {
+        return Err(Error::InvalidOperation);
+    }
+    let mut payload = [0; 6 + ROUTE_IFACE_LEN];
+    payload[..2].copy_from_slice(&address.to_be_bytes());
+    payload[2..4].copy_from_slice(&via.unwrap_or(u16::MAX).to_be_bytes());
+    payload[4..6].copy_from_slice(&netmask.to_be_bytes());
+    payload[6..6 + interface.len()].copy_from_slice(interface.as_bytes());
+    request(node, timeout, ROUTE_SET_V2, &mut payload).await
+}
+
+/// Read the remote clock, or set it first when `set_time` is provided.
+///
+/// A seconds value of zero is interpreted by the protocol as a read request.
+pub async fn clock(
+    node: u16,
+    timeout: u32,
+    set_time: Option<(u32, u32)>,
+) -> Result<(u32, u32), Error> {
+    let mut payload = [0; 8];
+    if let Some((seconds, nanos)) = set_time {
+        payload[..4].copy_from_slice(&seconds.to_be_bytes());
+        payload[4..].copy_from_slice(&nanos.to_be_bytes());
+    }
+    request(node, timeout, CLOCK, &mut payload).await?;
+    Ok((
+        u32::from_be_bytes(payload[..4].try_into().unwrap()),
+        u32::from_be_bytes(payload[4..].try_into().unwrap()),
+    ))
+}
+
+/// Send a CMP request and replace `message` with the response.
+///
+/// `message` is the payload excluding the two-byte CMP type/code header.
+/// The request and response payloads must have equal lengths. The request uses
+/// CRC32, and the reply must carry the matching response type and request code.
+pub async fn request(node: u16, timeout: u32, code: u8, message: &mut [u8]) -> Result<(), Error> {
+    if message.len() + 2 > MAX_CMP_REQUEST {
+        return Err(Error::BufferOverflow);
+    }
+
+    let message_len = message.len();
+    let mut buffer = [0; MAX_CMP_MSG];
+    buffer[0] = REQUEST;
+    buffer[1] = code;
+    buffer[2..message_len + 2].copy_from_slice(message);
+
+    let mut stream = CspStream::connect(
+        Priority::Normal,
+        node,
+        crate::CSP_CMP,
+        crate::ConnOptions::CSP_O_CRC32,
+    )
+    .await?;
+    let sent = stream.send(&buffer[..message_len + 2]).await?;
+    if sent != message_len + 2 {
+        stream.close().await;
+        return Err(Error::InvalidOperation);
+    }
+
+    let result = stream.read(&mut buffer, timeout).await;
+    stream.close().await;
+    let response_len = result?;
+    if response_len != message_len + 2 || buffer[0] != REPLY || buffer[1] != code {
+        return Err(Error::InvalidOperation);
+    }
+    message.copy_from_slice(&buffer[2..response_len]);
+    Ok(())
+}
+
+/// Handle a CMP request; return whether routing should reply, consume, or continue.
+pub(crate) async fn handle(packet: &mut crate::Packet) -> Result<Option<bool>, Error> {
+    if packet.data_length() < 2 {
+        return Err(Error::InvalidOperation);
+    }
+
+    let data = packet.data();
+    if data[0] != REQUEST {
+        return Err(Error::InvalidOperation);
+    }
+    let code = data[1];
+    let payload = &data[2..];
+    let mut reply = [0; MAX_CMP_MSG];
+    reply[..2].copy_from_slice(&[REPLY, code]);
+    let response_len = match code {
+        IDENT => {
+            if payload.len() != IDENT_MSG_LEN - 2 {
+                return Err(Error::InvalidOperation);
+            }
+            let identity = crate::services::identity().ok_or(Error::FeatureDisabled)?;
+            let mut cursor = 2;
+            for value in [
+                &identity.hostname[..],
+                &identity.model[..],
+                &identity.revision[..],
+                &identity.date[..],
+                &identity.time[..],
+            ] {
+                reply[cursor..cursor + value.len()].copy_from_slice(value);
+                cursor += value.len();
+            }
+            cursor
+        }
+        IF_STATS => {
+            if payload.len() != IF_STATS_PAYLOAD_LEN {
+                return Err(Error::InvalidOperation);
+            }
+            let name = fixed_name(&payload[..ROUTE_IFACE_LEN]);
+            let stats = crate::interfaces::interface_stats(&name).ok_or(Error::InvalidOperation)?;
+            reply[2..2 + ROUTE_IFACE_LEN].copy_from_slice(&payload[..ROUTE_IFACE_LEN]);
+            let fields = [
+                stats.tx,
+                stats.rx,
+                stats.tx_error,
+                stats.rx_error,
+                stats.drop,
+                stats.autherr,
+                stats.frame,
+                stats.txbytes,
+                stats.rxbytes,
+                stats.irq,
+            ];
+            let mut cursor = 2 + ROUTE_IFACE_LEN;
+            for field in fields {
+                reply[cursor..cursor + 4].copy_from_slice(&field.to_be_bytes());
+                cursor += 4;
+            }
+            cursor
+        }
+        ROUTE_SET_V1 => {
+            if payload.len() != 2 + ROUTE_IFACE_LEN {
+                return Err(Error::InvalidOperation);
+            }
+            let address = payload[0] as u16;
+            // Version 1 uses 0xff to mean that the route has no next hop.
+            let via = (payload[1] != u8::MAX).then_some(payload[1] as u16);
+            set_route(
+                address,
+                crate::id::get_host_bits() as u16,
+                &payload[2..],
+                via,
+            )
+            .await?;
+            2 + payload.len()
+        }
+        ROUTE_SET_V2 => {
+            if payload.len() != 6 + ROUTE_IFACE_LEN {
+                return Err(Error::InvalidOperation);
+            }
+            let address = u16::from_be_bytes([payload[0], payload[1]]);
+            let via_raw = u16::from_be_bytes([payload[2], payload[3]]);
+            let netmask = u16::from_be_bytes([payload[4], payload[5]]);
+            // Version 2 uses 0xffff as the no-next-hop sentinel.
+            let via = (via_raw != u16::MAX).then_some(via_raw);
+            set_route(address, netmask, &payload[6..], via).await?;
+            2 + payload.len()
+        }
+        CLOCK => {
+            if payload.len() != 8 {
+                return Err(Error::InvalidOperation);
+            }
+            let seconds = u32::from_be_bytes(payload[..4].try_into().unwrap());
+            let nanos = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+            let hooks = crate::services::hooks().ok_or(Error::FeatureDisabled)?;
+            if seconds != 0 {
+                (hooks.clock_set.ok_or(Error::FeatureDisabled)?)(seconds, nanos)?;
+            }
+            let (seconds, nanos) = (hooks.clock_get.ok_or(Error::FeatureDisabled)?)();
+            reply[2..6].copy_from_slice(&seconds.to_be_bytes());
+            reply[6..10].copy_from_slice(&nanos.to_be_bytes());
+            10
+        }
+        // Arbitrary memory access is deliberately not implemented.
+        PEEK | POKE | PEEK_V2 | POKE_V2 => return Err(Error::FeatureDisabled),
+        _ => return Err(Error::InvalidOperation),
     };
 
-    // SAFETY: The caller guarantees that the pointer and size are valid.
-    unsafe { csp_cmp(node, timeout, code as u8, msg_size, msg) }
+    let old_len = packet.data_length();
+    packet.remove_data(old_len);
+    packet.append_data(&reply[..response_len])?;
+    Ok(Some(true))
 }
 
-/// Calls CMP with an identification message.
-pub(crate) unsafe fn cmp_ident(
-    node: u16,
-    timeout: u32,
-    msg: *mut CspCmpIdentMsg,
-) -> i32 {
-    // SAFETY: The caller guarantees that msg points to a valid message.
-    unsafe {
-        cmp(
-            node,
-            timeout,
-            CspCmpCode::Ident,
-            core::mem::size_of::<CspCmpIdentMsg>(),
-            msg.cast(),
-        )
-    }
+fn fixed_name(name: &[u8]) -> &[u8] {
+    // Interface names are NUL-padded in CMP's fixed-width fields.
+    let len = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    &name[..len]
 }
 
-/// Calls CMP with a route-set V1 message.
-pub(crate) unsafe fn cmp_route_set_v1(
-    node: u16,
-    timeout: u32,
-    msg: *mut CspCmpRouteSetV1Msg,
-) -> i32 {
-    unsafe {
-        cmp(
-            node,
-            timeout,
-            CspCmpCode::RouteSetV1,
-            core::mem::size_of::<CspCmpRouteSetV1Msg>(),
-            msg.cast(),
-        )
-    }
-}
-
-/// Calls CMP with an interface statistics message.
-pub(crate) unsafe fn cmp_if_stats(
-    node: u16,
-    timeout: u32,
-    msg: *mut CspCmpIfStatsMsg,
-) -> i32 {
-    unsafe {
-        cmp(
-            node,
-            timeout,
-            CspCmpCode::IfStats,
-            core::mem::size_of::<CspCmpIfStatsMsg>(),
-            msg.cast(),
-        )
-    }
-}
-
-/// Calls CMP with a clock message.
-pub(crate) unsafe fn cmp_clock(
-    node: u16,
-    timeout: u32,
-    msg: *mut CspCmpClockMsg,
-) -> i32 {
-    unsafe {
-        cmp(
-            node,
-            timeout,
-            CspCmpCode::Clock,
-            core::mem::size_of::<CspCmpClockMsg>(),
-            msg.cast(),
-        )
-    }
-}
-
-/// Calls CMP with a route-set V2 message.
-pub(crate) unsafe fn cmp_route_set_v2(
-    node: u16,
-    timeout: u32,
-    msg: *mut CspCmpRouteSetV2Msg,
-) -> i32 {
-    unsafe {
-        cmp(
-            node,
-            timeout,
-            CspCmpCode::RouteSetV2,
-            core::mem::size_of::<CspCmpRouteSetV2Msg>(),
-            msg.cast(),
-        )
-    }
-}
-
-/// Calls CMP with a PEEK message and its trailing data buffer.
-///
-/// # Safety
-///
-/// `msg` must point to a buffer large enough for the fixed prefix,
-/// alignment padding, and `len` data bytes.
-pub(crate) unsafe fn cmp_peek(
-    node: u16,
-    timeout: u32,
-    msg: *mut CspCmpPeekMsg,
-    len: u8,
-) -> i32 {
-    unsafe {
-        cmp(
-            node,
-            timeout,
-            CspCmpCode::Peek,
-            cmp_peek_size(len as usize),
-            msg.cast(),
-        )
-    }
-}
-
-/// Calls CMP with a POKE message and its trailing data buffer.
-///
-/// # Safety
-///
-/// `msg` must point to a buffer large enough for the fixed prefix,
-/// alignment padding, and `len` data bytes.
-pub(crate) unsafe fn cmp_poke(
-    node: u16,
-    timeout: u32,
-    msg: *mut CspCmpPokeMsg,
-    len: u8,
-) -> i32 {
-    unsafe {
-        cmp(
-            node,
-            timeout,
-            CspCmpCode::Poke,
-            cmp_poke_size(len as usize),
-            msg.cast(),
-        )
-    }
-}
-
-/// Calls CMP with a PEEK V2 message and its trailing data buffer.
-///
-/// # Safety
-///
-/// `msg` must point to a buffer large enough for the fixed prefix,
-/// alignment padding, and `len` data bytes.
-pub(crate) unsafe fn cmp_peek_v2(
-    node: u16,
-    timeout: u32,
-    msg: *mut CspCmpPeekV2Msg,
-    len: u8,
-) -> i32 {
-    unsafe {
-        cmp(
-            node,
-            timeout,
-            CspCmpCode::PeekV2,
-            cmp_peek_v2_size(len as usize),
-            msg.cast(),
-        )
-    }
-}
-
-/// Calls CMP with a POKE V2 message and its trailing data buffer.
-///
-/// # Safety
-///
-/// `msg` must point to a buffer large enough for the fixed prefix,
-/// alignment padding, and `len` data bytes.
-pub(crate) unsafe fn cmp_poke_v2(
-    node: u16,
-    timeout: u32,
-    msg: *mut CspCmpPokeV2Msg,
-    len: u8,
-) -> i32 {
-    unsafe {
-        cmp(
-            node,
-            timeout,
-            CspCmpCode::PokeV2,
-            cmp_poke_v2_size(len as usize),
-            msg.cast(),
-        )
-    }
+async fn set_route(address: u16, netmask: u16, name: &[u8], via: Option<u16>) -> Result<(), Error> {
+    let interface_name = fixed_name(name);
+    let interface =
+        crate::interfaces::interface_id_by_name(&interface_name).ok_or(Error::InvalidOperation)?;
+    #[cfg(feature = "rtable")]
+    crate::rtable::set(address, netmask as i16, interface, via).await?;
+    // Match builds where the C route table is disabled: validate the interface,
+    // but do not attempt to install a route.
+    #[cfg(not(feature = "rtable"))]
+    let _ = (address, netmask, interface, via);
+    Ok(())
 }

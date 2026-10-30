@@ -64,6 +64,18 @@ const _: () = {
 };
 
 impl PacketBuf {
+    pub(crate) fn remaining() -> usize {
+        let pool = core::ptr::addr_of!(PACKET_POOL).cast::<PacketBuf>();
+        // This is a concurrent count, so allocations may change it during the scan.
+        (0..CSP_BUFFER_COUNT)
+            .filter(|index| {
+                // SAFETY: Each pool entry has static storage and the atomic counter
+                // can be read independently while packets are allocated or released.
+                unsafe { (*pool.add(*index)).ref_count.load(Ordering::Acquire) == 0 }
+            })
+            .count()
+    }
+
     /// allocate packet from packet pool
     fn get() -> Option<&'static mut Self> {
         // loop through
@@ -196,7 +208,10 @@ impl PacketBuf {
         return crc;
     }
 
-    /// Calculate and append CRC32, returns error if not enough memory
+    /// Append the CSP CRC32 trailer.
+    ///
+    /// New transmissions checksum the packed CSP header and payload. The
+    /// receiver also accepts the legacy payload-only checksum format.
     pub(crate) fn append_crc32(&mut self) -> Result<(), ()> {
         if self.length as usize + size_of::<u32>() > CSP_BUFFER_SIZE {
             return Err(());

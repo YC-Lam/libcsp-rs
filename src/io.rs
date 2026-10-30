@@ -211,7 +211,7 @@ pub(crate) async fn send_direct_iface(
         packet.id = *idout;
     }
 
-    /* Only encrypt packets from the current node */
+    /* Add authentication and checksums only to packets originated here. */
     if from_me {
         /* Append HMAC */
         if idout.flags.contains(Flags::CSP_FHMAC) {
@@ -231,7 +231,7 @@ pub(crate) async fn send_direct_iface(
 
         /* Append CRC32 */
         if idout.flags.contains(Flags::CSP_FCRC32) {
-            /* Calculate and add CRC32 (does not include header for backwards compatibility with csp1.x) */
+            /* New CRC32 trailers cover the packed header and payload. */
             if packet.append_crc32().is_err() {
                 /* CRC32 append failed */
                 drop(packet);
@@ -277,7 +277,11 @@ pub(crate) async fn send(conn: &mut Connection, mut packet: Packet) -> Result<()
     send_direct(conn.idout(), packet, None).await
 }
 
-async fn send_prio(prio: Priority, conn: &mut Connection, packet: Packet) -> Result<(), Error> {
+pub(crate) async fn send_prio(
+    prio: Priority,
+    conn: &mut Connection,
+    packet: Packet,
+) -> Result<(), Error> {
     conn.set_idout_prio(prio);
     send(conn, packet).await
 }
@@ -319,7 +323,7 @@ async fn transaction_persistent(
 /// Perform an entire request & reply transaction.
 ///
 /// Creates a connection, send outbuf, wait for reply, copy reply to inbuf and close the connection.
-async fn transaction_w_opts(
+pub(crate) async fn transaction_w_opts(
     prio: Priority,
     dest: u16,
     port: u8,
@@ -376,28 +380,23 @@ pub(crate) async fn send_to(
     send_direct(&id, packet, None).await
 }
 
-async fn sendto_reply(
-    request_packet: &Packet,
-    mut reply_packet: Packet,
-    opts: ConnOptions,
+pub(crate) async fn send_service_reply(
+    mut packet: Packet,
+    request_was_broadcast: bool,
 ) -> Result<(), Error> {
-    // check same
-    if opts.contains(ConnOptions::CSP_O_SAME) {
-        reply_packet.id.flags = request_packet.id.flags;
-    }
-    let dst = request_packet.id.src;
-    if request_packet.id.dst != crate::id::get_max_nodeid() {
-        reply_packet.id.src = request_packet.id.dst;
+    let request_id = packet.id;
+    // Reuse the request packet, reversing endpoints and preserving negotiated flags.
+    // A broadcast address is not a valid source address; let routing select the
+    // outgoing interface's address instead.
+    packet.id.src = if request_was_broadcast {
+        0
     } else {
-        reply_packet.id.src = 0;
-    }
-    send_to(
-        request_packet.id.prio,
-        dst,
-        request_packet.id.sport,
-        request_packet.id.dport,
-        opts,
-        reply_packet,
-    )
-    .await
+        request_id.dst
+    };
+    packet.id.dst = request_id.src;
+    packet.id.sport = request_id.dport;
+    packet.id.dport = request_id.sport;
+    packet.id.prio = request_id.prio;
+    let id = packet.id;
+    send_direct(&id, packet, None).await
 }

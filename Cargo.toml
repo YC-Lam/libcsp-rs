@@ -42,8 +42,7 @@ rtable = []
 
 defmt = ["dep:defmt"]
 embassy = ["dep:embassy-sync", "dep:embassy-time", "defmt"]
-embassy_stm32 = ["embassy", "dep:embassy-stm32", "dep:embedded-can", "dep:embassy-executor", "dep:embassy-futures"]
-embassy_stm32_time = ["embassy_stm32", "embassy-stm32/time"]
+embassy_stm32 = ["embassy", "dep:embassy-stm32", "dep:embedded-can", "dep:embassy-executor", "dep:embassy-futures", "embassy-stm32/time"]
 
 std = ["dep:tokio", "dep:smol"]
 zmq = ["std", "dep:zmq"]
@@ -51,4 +50,4 @@ zmq = ["std", "dep:zmq"]
 [[example]]
 name = "can_stm32"
 target = "thumbv7em-none-eabi"
-required-features = ["embassy_stm32", "embassy_stm32_time", "embassy-stm32/stm32g431kb", "embassy-executor/executor-thread", "embassy-executor/platform-cortex-m"]
+required-features = ["embassy_stm32", "embassy-stm32/stm32g431kb", "embassy-executor/executor-thread", "embassy-executor/platform-cortex-m"]

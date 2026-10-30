@@ -14,44 +14,6 @@ pub fn get_seconds() -> u32 {
     embassy_time::Instant::now().as_secs() as u32
 }
 
-type EmbassyMutex<T> = embassy_sync::mutex::Mutex<CriticalSectionRawMutex, T>;
-
-pub struct Mutex<T> {
-    inner: EmbassyMutex<T>,
-}
-
-impl<T> Mutex<T> {
-    pub const fn new(value: T) -> Self {
-        Self {
-            inner: EmbassyMutex::new(value),
-        }
-    }
-
-    pub async fn lock<'a>(&'a self) -> MutexGuard<'a, T> {
-        MutexGuard {
-            inner: self.inner.lock().await,
-        }
-    }
-}
-
-pub struct MutexGuard<'a, T> {
-    inner: embassy_sync::mutex::MutexGuard<'a, CriticalSectionRawMutex, T>,
-}
-
-impl<T> Deref for MutexGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<T> DerefMut for MutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
 pub struct Queue<T, const N: usize> {
     inner: embassy_sync::channel::Channel<CriticalSectionRawMutex, Option<T>, N>,
     closed: AtomicBool,
@@ -143,11 +105,11 @@ impl<T, const N: usize> Queue<T, N> {
     }
 }
 
-pub struct Semaphore<const N: usize> {
+pub struct Semaphore {
     inner: GreedySemaphore<CriticalSectionRawMutex>,
 }
 
-impl<const N: usize> Semaphore<N> {
+impl Semaphore {
     /// Create an initially available binary semaphore.
     pub const fn new() -> Self {
         Self {

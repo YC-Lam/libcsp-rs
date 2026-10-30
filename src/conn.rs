@@ -213,6 +213,8 @@ impl ConnectionBuf {
                 conn.conn_type = conn_type;
                 conn.idin.flags = Flags::empty();
                 conn.idout.flags = Flags::empty();
+                #[cfg(feature = "rdp")]
+                conn.rdp.reset();
 
                 CONN_LAST_GIVEN.store(i, Ordering::Relaxed);
 

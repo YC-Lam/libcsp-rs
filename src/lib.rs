@@ -3,6 +3,7 @@
 #[cfg(any(test, feature = "std"))]
 extern crate std;
 
+pub mod cmp;
 #[cfg(feature = "hmac")]
 pub mod crypto;
 pub mod drivers;
@@ -10,10 +11,10 @@ pub mod interfaces;
 pub mod promisc;
 #[cfg(feature = "rtable")]
 pub mod rtable;
+pub mod services;
 pub mod sfp;
 
 mod arch;
-// mod cmp;
 mod bridge;
 mod buffer;
 mod conn;
@@ -61,6 +62,7 @@ pub enum Error {
     PortBusy,
     AllocError,
     CanBusError,
+    Uart,
     Sfp,
     Mtu,
 }
@@ -170,6 +172,22 @@ impl CspStream {
             packet.append_data(data)?;
 
             io::send(conn, packet).await?;
+
+            return Ok(data.len());
+        } else {
+            return Err(Error::ConnectionClosed);
+        }
+    }
+
+    /// Send packet on a connection with priority.
+    /// This will fail if total data is larger then 256 bytes.
+    /// CRC32 costs 4 bytes and RDP header costs 5 bytes if enabled.
+    pub async fn send_prio(&mut self, prio: Priority, data: &[u8]) -> Result<usize, Error> {
+        if let Some(conn) = self.conn.as_mut() {
+            let mut packet = Packet::get().ok_or(Error::AllocError)?;
+            packet.append_data(data)?;
+
+            io::send_prio(prio, conn, packet).await?;
 
             return Ok(data.len());
         } else {
@@ -421,4 +439,19 @@ impl SfpListener {
     pub async fn close(&mut self) {
         self.listener.close().await
     }
+}
+
+/// Perform an entire request & reply transaction.
+///
+/// Creates a connection, send outbuf, wait for reply, copy reply to inbuf and close the connection.
+pub async fn transaction(
+    prio: Priority,
+    dest: u16,
+    port: u8,
+    timeout: u32,
+    outbuf: &[u8],
+    inbuf: &mut [u8],
+    opts: ConnOptions,
+) -> Result<usize, Error> {
+    return io::transaction_w_opts(prio, dest, port, timeout, outbuf, inbuf, opts).await;
 }

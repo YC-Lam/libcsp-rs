@@ -1,6 +1,7 @@
-//! This is a implementation of the seq/ack handling taken from the Reliable Datagram Protocol (RDP)
-//! For more information read RFC 908/1151. The implementation has been extended to include support for
-//! delayed acknowledgments, to improve performance over half-duplex links.
+//! Reliable Datagram Protocol (RDP) sequence/acknowledgment handling based on
+//! RFC 908/1151. This implementation supports delayed acknowledgments for
+//! half-duplex links; the router must call [`check_timeouts`] regularly for
+//! retransmission and connection timeout processing.
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use bitflags::bitflags;
@@ -83,7 +84,7 @@ pub(crate) struct RdpConnection {
     ack_timeout: u32,
     ack_delay_count: u32,
     ack_timestamp: u32,
-    tx_wait: Semaphore<4>,
+    tx_wait: Semaphore,
 }
 
 impl RdpConnection {
@@ -106,6 +107,25 @@ impl RdpConnection {
             ack_timestamp: 0,
             tx_wait: Semaphore::new(),
         }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.state = RdpState::Closed;
+        self.closed_by = 0;
+        self.snd_nxt = 0;
+        self.snd_una = 0;
+        self.snd_iss = 0;
+        self.rcv_cur = 0;
+        self.rcv_irs = 0;
+        self.rcv_lsa = 0;
+        self.window_size = 0;
+        self.conn_timeout = CSP_RDP_CONN_TIMEOUT;
+        self.packet_timeout = CSP_RDP_PACKET_TIMEOUT;
+        self.delayed_acks = 0;
+        self.ack_timeout = 0;
+        self.ack_delay_count = 0;
+        self.ack_timestamp = 0;
+        self.tx_wait.post();
     }
 }
 /**
@@ -131,6 +151,7 @@ impl RdpHeader {
 
     #[inline]
     fn from_packet(packet: &Packet) -> &mut RdpHeader {
+        debug_assert!(packet.data_length() >= size_of::<RdpHeader>());
         unsafe {
             let ptr = packet
                 .data()
@@ -139,6 +160,15 @@ impl RdpHeader {
             return (ptr as *mut RdpHeader).as_mut_unchecked();
         }
     }
+}
+
+fn has_rdp_header(packet: &Packet) -> bool {
+    packet.data_length() >= CSP_RDP_HEADER_SIZE
+}
+
+fn has_syn_options(packet: &Packet) -> bool {
+    // SYN carries six 32-bit option values before its five-byte RDP header.
+    packet.data_length() >= CSP_RDP_HEADER_SIZE + 6 * size_of::<u32>()
 }
 
 /* Functions for comparing wrapping sequence numbers and timestamps */
@@ -563,6 +593,11 @@ pub(crate) async fn new_packet(
 ) -> bool {
     let mut close_connection = false;
 
+    if !has_rdp_header(&packet) {
+        // A newly allocated server-side connection must be reclaimed too.
+        return !conn.socket_delivered();
+    }
+
     /* Get RX header and convert to host byte-order */
     let rx_header = RdpHeader::from_packet(&packet);
     rx_header.ack_nr = u16::from_be(rx_header.ack_nr);
@@ -681,6 +716,10 @@ pub(crate) async fn new_packet(
                 let _ = send_cmp(conn, None, RdpFlags::RDP_RST, seq_nr, ack_nr).await;
 
                 return discard_close(conn, closed_by, packet, close_connection).await;
+            }
+
+            if !has_syn_options(&packet) {
+                return !conn.socket_delivered();
             }
 
             // csp_rdp_protocol("RDP %p: SYN-Received\n", (void *)conn);
@@ -1032,7 +1071,7 @@ pub(crate) async fn connect(conn: &mut Connection) -> Result<(), Error> {
     conn.rdp_connection_mut().ack_delay_count = CSP_RDP_ACK_DELAY_COUNT;
     conn.rdp_connection_mut().ack_timestamp = crate::arch::get_ms();
 
-    loop {
+    let connect_error = loop {
         if conn.rdp_connection().state == RdpState::Open {
             #[cfg(feature = "defmt")]
             defmt::warn!("RDP connect requested for already-open connection");
@@ -1063,33 +1102,39 @@ pub(crate) async fn connect(conn: &mut Connection) -> Result<(), Error> {
         // csp_rdp_protocol("RDP %p: AC: Waiting for SYN/ACK reply...\n", (void *)conn);
 
         let timeout = conn.rdp_connection().conn_timeout;
-        let result = conn.rdp_connection().tx_wait.wait(timeout).await;
+        let wait_result = conn.rdp_connection().tx_wait.wait(timeout).await;
 
-        if result.is_ok() {
-            if conn.rdp_connection().state == RdpState::Open {
-                #[cfg(feature = "defmt")]
-                defmt::info!("RDP active connection established");
-                return Ok(());
-            }
-            if conn.rdp_connection().state == RdpState::SynSent {
-                if retry > 0 {
-                    #[cfg(feature = "defmt")]
-                    defmt::warn!("RDP half-open connection; retrying handshake");
-                    rdp_queue::flush(Some(conn.connection_id())).await;
-
-                    retry = 0;
-                    continue;
-                }
-                #[cfg(feature = "defmt")]
-                defmt::error!("RDP connection remained half-open after retry");
-                break;
-            }
+        if conn.rdp_connection().state == RdpState::Open {
+            #[cfg(feature = "defmt")]
+            defmt::info!("RDP active connection established");
+            return Ok(());
         }
-    }
+        if consume_handshake_retry(conn.rdp_connection().state, &mut retry) {
+            #[cfg(feature = "defmt")]
+            defmt::warn!("RDP handshake timed out; retrying once");
+            rdp_queue::flush(Some(conn.connection_id())).await;
+
+            continue;
+        }
+        break match wait_result {
+            Err(error) => error,
+            Ok(()) => Error::ConnectionClosed,
+        };
+    };
 
     #[cfg(feature = "defmt")]
     defmt::error!("RDP active connection failed");
-    return close_internal(conn, CSP_RDP_CLOSED_BY_PROTOCOL, false).await;
+    let _ = close_internal(conn, CSP_RDP_CLOSED_BY_PROTOCOL, false).await;
+    Err(connect_error)
+}
+
+fn consume_handshake_retry(state: RdpState, retries_remaining: &mut u8) -> bool {
+    if state != RdpState::SynSent || *retries_remaining == 0 {
+        return false;
+    }
+
+    *retries_remaining -= 1;
+    true
 }
 
 pub(crate) async fn send(conn: &mut Connection, packet: &mut Packet) -> Result<(), Error> {
@@ -1299,6 +1344,54 @@ mod tests {
         assert_eq!(connection.conn_timeout, CSP_RDP_CONN_TIMEOUT);
         assert_eq!(connection.packet_timeout, CSP_RDP_PACKET_TIMEOUT);
         assert_eq!(connection.delayed_acks, 0);
+    }
+
+    #[test]
+    fn reset_clears_state_left_by_a_previous_connection() {
+        let mut connection = RdpConnection::const_new();
+        connection.state = RdpState::CloseWait;
+        connection.closed_by = CSP_RDP_CLOSED_BY_ALL;
+        connection.snd_nxt = 12;
+        connection.window_size = 8;
+        connection.reset();
+
+        assert_eq!(connection.state, RdpState::Closed);
+        assert_eq!(connection.closed_by, 0);
+        assert_eq!(connection.snd_nxt, 0);
+        assert_eq!(connection.window_size, 0);
+        assert_eq!(connection.conn_timeout, CSP_RDP_CONN_TIMEOUT);
+    }
+
+    #[test]
+    fn incoming_rdp_packets_require_complete_headers_and_syn_options() {
+        let mut packet = Packet::get().unwrap();
+        assert!(!has_rdp_header(&packet));
+        assert!(!has_syn_options(&packet));
+
+        packet.append_data(&[0; CSP_RDP_HEADER_SIZE]).unwrap();
+        assert!(has_rdp_header(&packet));
+        assert!(!has_syn_options(&packet));
+
+        packet.append_data(&[0; 6 * size_of::<u32>()]).unwrap();
+        assert!(has_syn_options(&packet));
+    }
+
+    #[test]
+    fn handshake_retry_is_bounded_and_only_applies_while_syn_sent() {
+        let mut retries_remaining = 1;
+        assert!(consume_handshake_retry(
+            RdpState::SynSent,
+            &mut retries_remaining
+        ));
+        assert_eq!(retries_remaining, 0);
+        assert!(!consume_handshake_retry(
+            RdpState::SynSent,
+            &mut retries_remaining
+        ));
+        assert!(!consume_handshake_retry(
+            RdpState::Open,
+            &mut retries_remaining
+        ));
     }
 
     #[test]

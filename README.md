@@ -49,3 +49,27 @@ destination when no `via` address is specified. Incoming CSP frames must be sent
 as controller writes containing the six-byte CSP header followed by its payload.
 Target read requests are not a CSP transport operation; the driver sends a
 one-byte invalid frame to release the I2C bus.
+
+The Embassy STM32 KISS interface carries CSP packets over an asynchronous UART.
+Configure the UART for the same baud rate and framing as the remote KISS TNC,
+then provide static queue and interface storage:
+
+```rust,ignore
+use csp::drivers::embassy_stm32::{KissStm32Driver, KissTxQueue};
+use csp::interfaces::{add_interface, kiss::KissInterface};
+use static_cell::StaticCell;
+
+static KISS_TX: StaticCell<KissTxQueue> = StaticCell::new();
+static KISS_IFACE: StaticCell<KissInterface<KissStm32Driver>> = StaticCell::new();
+
+// Configure an async Embassy UART for the board's peripheral, pins, and DMA.
+let tx_queue = KISS_TX.init(KissTxQueue::new());
+let driver = KissStm32Driver::new(uart, tx_queue, spawner.make_send());
+let iface = KISS_IFACE.init(KissInterface::new(1, 14, "KISS", true, driver));
+add_interface(iface);
+```
+
+KISS frames use command `0x00` (TNC data), escape `0xC0` and `0xDB` according
+to the KISS wire format, and contain a packed six-byte CSP header followed by
+the packet payload. CRC32 behavior is controlled by the CSP packet flags and
+handled by the CSP router.

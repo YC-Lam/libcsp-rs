@@ -63,6 +63,7 @@ pub(crate) fn get_socket(port: u8) -> Option<&'static SocketState> {
 }
 
 #[repr(u8)]
+#[allow(unused)]
 pub(crate) enum Port {
     Closed = 0,
     Open(usize),
