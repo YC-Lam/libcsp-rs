@@ -1,13 +1,13 @@
 #![cfg(feature = "rdp")]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use csp::interfaces::InterfaceID;
 use csp::interfaces::can::{CanInterface, CanInterfaceDriver};
-use csp::{ConnOptions, CspListener, CspStream, Error, Packet, Priority, add_interface};
+use csp::interfaces::InterfaceID;
+use csp::{add_interface, ConnOptions, CspListener, CspStream, Error, Packet, Priority};
 use serial_test::serial;
 use static_cell::StaticCell;
 use tokio::sync::mpsc;
@@ -100,13 +100,13 @@ async fn drive_router<T>(future: impl core::future::Future<Output = T>) -> T {
 #[tokio::test]
 #[serial]
 async fn rdp_stream_connects_and_reports_empty_read_timeout() {
-    let listener = CspListener::bind(30).await.unwrap();
+    let listener = CspListener::bind(14).await.unwrap();
 
     let result = tokio::time::timeout(Duration::from_secs(3), async {
         let mut client = drive_router(CspStream::connect(
             Priority::Normal,
             0,
-            30,
+            14,
             ConnOptions::RDP,
         ))
         .await
@@ -129,14 +129,14 @@ async fn rdp_stream_connects_and_reports_empty_read_timeout() {
 #[tokio::test]
 #[serial]
 async fn rdp_stream_sends_and_receives_in_both_directions() {
-    let listener = CspListener::bind(31).await.unwrap();
+    let listener = CspListener::bind(15).await.unwrap();
 
     let result = tokio::time::timeout(Duration::from_secs(3), async {
         // Keep routing active while the client completes the RDP handshake.
         let mut client = drive_router(CspStream::connect(
             Priority::Normal,
             0,
-            31,
+            15,
             ConnOptions::RDP,
         ))
         .await
@@ -171,6 +171,98 @@ async fn rdp_stream_sends_and_receives_in_both_directions() {
 
 #[tokio::test]
 #[serial]
+async fn rdp_stream_sends_more_than_one_window_in_order() {
+    let listener = CspListener::bind(12).await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut client = drive_router(CspStream::connect(
+            Priority::Normal,
+            0,
+            12,
+            ConnOptions::RDP,
+        ))
+        .await
+        .unwrap();
+        let mut server = drive_router(listener.accept(1_000)).await.unwrap();
+
+        drive_router(async {
+            for payload in [
+                b"packet 1".as_slice(),
+                b"packet 2",
+                b"packet 3",
+                b"packet 4",
+                b"packet 5",
+                b"packet 6",
+            ] {
+                assert_eq!(client.send(payload).await, Ok(payload.len()));
+            }
+
+            let mut received = [0; 32];
+            for expected in [
+                b"packet 1".as_slice(),
+                b"packet 2",
+                b"packet 3",
+                b"packet 4",
+                b"packet 5",
+                b"packet 6",
+            ] {
+                let length = server.read(&mut received, 1_000).await.unwrap();
+                assert_eq!(&received[..length], expected);
+            }
+        })
+        .await;
+
+        client.close().await;
+        server.close().await;
+    })
+    .await;
+
+    result.expect("RDP did not advance its send window");
+    let mut listener = listener;
+    listener.close().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn rdp_peer_observes_connection_close() {
+    let listener = CspListener::bind(13).await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut client = drive_router(CspStream::connect(
+            Priority::Normal,
+            0,
+            13,
+            ConnOptions::RDP,
+        ))
+        .await
+        .unwrap();
+        let mut server = drive_router(listener.accept(1_000)).await.unwrap();
+
+        client.close().await;
+        assert!(!client.is_active());
+
+        let mut buffer = [0; 32];
+        assert_eq!(
+            drive_router(server.read(&mut buffer, 1_000)).await,
+            Err(Error::ConnectionClosed)
+        );
+        assert!(!server.is_active());
+        assert_eq!(
+            server.send(b"after close").await,
+            Err(Error::ConnectionClosed)
+        );
+
+        server.close().await;
+    })
+    .await;
+
+    result.expect("RDP peer did not observe connection close");
+    let mut listener = listener;
+    listener.close().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn rdp_retransmits_data_after_mock_interface_drops_first_transmission() {
     static INTERFACE: StaticCell<CanInterface<LossyCanDriver>> = StaticCell::new();
 
@@ -193,13 +285,13 @@ async fn rdp_retransmits_data_after_mock_interface_drops_first_transmission() {
         dropped_data.clone(),
         observed_data.clone(),
     ));
-    let listener = CspListener::bind(32).await.unwrap();
+    let listener = CspListener::bind(16).await.unwrap();
 
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let mut client = drive_router(CspStream::connect(
             Priority::Normal,
             REMOTE_ADDR,
-            32,
+            16,
             ConnOptions::RDP,
         ))
         .await

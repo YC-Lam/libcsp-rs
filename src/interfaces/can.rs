@@ -21,8 +21,9 @@ const CFP2_IDENTITY_MASK: u32 = (0x3fff << CFP2_DST_OFFSET)
     | (0x3 << CFP2_PACKET_COUNT_OFFSET);
 const MAX_ALIASES: usize = 8;
 
-/// Driver interface for an extended (29-bit) CAN controller.
+/// Driver interface for an extended (29-bit) CAN or CAN-FD controller.
 ///
+/// The interface passes at most 8 data bytes for classic CAN and 64 for CAN-FD.
 /// The driver must only use `data` and `packet` for the duration of this call. If
 /// transmission is pending, it must retain any frame data it needs and arrange for
 /// the supplied waker to be notified when it can be polled again.

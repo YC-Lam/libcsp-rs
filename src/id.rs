@@ -5,6 +5,7 @@
 use bitflags::bitflags;
 
 const CSP_ID2_HOST_SIZE: usize = 14;
+#[allow(unused)]
 const CSP_ID2_PORT_SIZE: usize = 6;
 
 const CSP_ID2_PRIO_MASK: u64 = 0x3;
@@ -127,14 +128,17 @@ impl CspId {
     }
 }
 
+#[allow(unused)]
 pub const fn get_host_bits() -> usize {
     CSP_ID2_HOST_SIZE
 }
 
+#[allow(unused)]
 pub const fn get_max_nodeid() -> u16 {
     (1 << CSP_ID2_HOST_SIZE) - 1
 }
 
+#[allow(unused)]
 pub const fn get_max_port() -> usize {
     (1 << CSP_ID2_PORT_SIZE) - 1
 }
@@ -174,6 +178,20 @@ pub fn is_broadcast(addr: u16, iface_addr: u16, iface_netmask: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn priority_and_address_width_helpers_cover_protocol_limits() {
+        assert_eq!(Priority::from_u8(0), Priority::Critical);
+        assert_eq!(Priority::from_u8(1), Priority::High);
+        assert_eq!(Priority::from_u8(2), Priority::Normal);
+        assert_eq!(Priority::from_u8(3), Priority::Low);
+        assert_eq!(get_host_bits(), CSP_ID2_HOST_SIZE);
+        assert_eq!(get_max_nodeid(), 0x3fff);
+        assert_eq!(get_max_port(), 0x3f);
+        assert_eq!(address_mask(0), 0);
+        assert_eq!(address_mask(14), 0x3fff);
+        assert_eq!(address_mask(usize::MAX), 0x3fff);
+    }
 
     #[test]
     fn full_width_subnet_does_not_broadcast_its_interface_address() {

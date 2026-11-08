@@ -3,6 +3,9 @@
 #[cfg(any(test, feature = "std"))]
 extern crate std;
 
+#[cfg(not(any(feature = "std", feature = "embassy")))]
+compile_error!("feature 'std' or 'embassy' must be enabled");
+
 pub mod cmp;
 #[cfg(feature = "hmac")]
 pub mod crypto;

@@ -1,6 +1,8 @@
 use core::task::{Context, Poll};
 
 use crate::buffer::{CSP_BUFFER_SIZE, Packet};
+#[cfg(feature = "kiss_crc")]
+use crate::crc32::CRC32;
 use crate::id::CspId;
 use crate::{Error, InterfaceID};
 
@@ -282,6 +284,10 @@ async fn finish_frame(iface_id: InterfaceID, state: &KissRxState) -> Result<(), 
     packet.id = CspId::from_header(&state.frame[..CSP_ID_HEADER_SIZE]);
     packet.timestamp_rx = crate::arch::get_ms();
     packet.append_data(&state.frame[CSP_ID_HEADER_SIZE..state.length])?;
+    #[cfg(feature = "kiss_crc")]
+    if !packet.verify_crc32() {
+        return Err(count_frame_error(iface_id, Error::CRC32));
+    }
     crate::qfifo::write(packet, iface_id).await;
     Ok(())
 }
@@ -304,12 +310,30 @@ fn encode_frame(
     payload: &[u8],
     output: &mut [u8],
 ) -> Result<usize, Error> {
+    if payload.len() > CSP_BUFFER_SIZE {
+        return Err(Error::BufferOverflow);
+    }
+    #[cfg(feature = "kiss_crc")]
+    if payload.len() + 4 > CSP_BUFFER_SIZE {
+        return Err(Error::BufferOverflow);
+    }
+
+    #[cfg(feature = "kiss_crc")]
+    let crc = {
+        let mut crc = CRC32::new();
+        crc.update(header);
+        crc.update(payload);
+        crc.finish().to_be_bytes()
+    };
+    #[cfg(not(feature = "kiss_crc"))]
+    let crc = [];
+
     let mut cursor = 0;
     output[cursor] = KISS_FEND;
     cursor += 1;
     output[cursor] = KISS_DATA;
     cursor += 1;
-    for &byte in header.iter().chain(payload) {
+    for &byte in header.iter().chain(payload).chain(crc.iter()) {
         if byte == KISS_FEND || byte == KISS_FESC {
             if cursor + 2 >= output.len() {
                 return Err(Error::BufferOverflow);
@@ -383,12 +407,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            &output[..length],
+            &output[..14],
             &[
                 KISS_FEND, KISS_DATA, KISS_FESC, KISS_TFEND, KISS_FESC, KISS_TFESC, 1, 2, 3, 4,
-                KISS_FESC, KISS_TFEND, KISS_FESC, KISS_TFESC, KISS_FEND
+                KISS_FESC, KISS_TFEND, KISS_FESC, KISS_TFESC,
             ]
         );
+        assert_eq!(output[length - 1], KISS_FEND);
+        assert!(length >= 15);
     }
 
     #[test]
@@ -414,19 +440,91 @@ mod tests {
         );
 
         let mut expected = vec![KISS_FEND, KISS_DATA];
-        expected.extend_from_slice(&packet.id.to_header());
+        let header = packet.id.to_header();
+        expected.extend_from_slice(&header);
         expected.extend_from_slice(b"test");
+        #[cfg(feature = "kiss_crc")]
+        {
+            let mut crc = CRC32::new();
+            crc.update(&header);
+            crc.update(b"test");
+            expected.extend_from_slice(&crc.finish().to_be_bytes());
+        }
         expected.push(KISS_FEND);
         assert_eq!(*sent.lock().unwrap(), expected);
     }
 
     #[test]
-    fn max_encoded_length_covers_every_byte_escaped() {
+    fn maximum_encoded_frame_fits_the_buffer() {
         let header = [KISS_FEND; CSP_ID_HEADER_SIZE];
+        let max_payload = if cfg!(feature = "kiss_crc") {
+            CSP_BUFFER_SIZE - 4
+        } else {
+            CSP_BUFFER_SIZE
+        };
         let payload = [KISS_FESC; CSP_BUFFER_SIZE];
         let mut output = [0; KISS_MAX_ENCODED_SIZE];
-        let length = encode_frame(&header, &payload, &mut output).unwrap();
-        assert_eq!(length, KISS_MAX_ENCODED_SIZE);
+        let length = encode_frame(&header, &payload[..max_payload], &mut output).unwrap();
+        assert!(length <= KISS_MAX_ENCODED_SIZE);
+    }
+
+    #[cfg(feature = "kiss_crc")]
+    #[test]
+    fn transmit_rejects_payload_that_leaves_no_room_for_link_crc() {
+        let mut output = [0; KISS_MAX_ENCODED_SIZE];
+        assert_eq!(
+            encode_frame(&[0; CSP_ID_HEADER_SIZE], &[0; CSP_BUFFER_SIZE], &mut output),
+            Err(Error::BufferOverflow)
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[allow(static_mut_refs)]
+    async fn receive_rejects_invalid_command_escape_short_frame_and_overflow() {
+        use crate::interfaces::INTERFACES;
+
+        INTERFACES.get_or_init().clear();
+        static mut IFACE: KissInterface<RxOnlyDriver> =
+            KissInterface::new(1, 14, KISS_DEFAULT_NAME, false, RxOnlyDriver);
+        let iface_id = unsafe { crate::add_interface(&mut IFACE) };
+
+        let mut decoder = KissRxState::new();
+        assert_eq!(
+            receive_bytes(iface_id, &mut decoder, &[KISS_FEND, 1, KISS_FEND]).await,
+            Err(Error::InvalidOperation)
+        );
+
+        let mut decoder = KissRxState::new();
+        assert_eq!(
+            receive_bytes(
+                iface_id,
+                &mut decoder,
+                &[KISS_FEND, KISS_DATA, KISS_FESC, 0x01, KISS_FEND],
+            )
+            .await,
+            Err(Error::InvalidOperation)
+        );
+
+        let mut decoder = KissRxState::new();
+        assert_eq!(
+            receive_bytes(
+                iface_id,
+                &mut decoder,
+                &[KISS_FEND, KISS_DATA, 1, 2, KISS_FEND],
+            )
+            .await,
+            Err(Error::InvalidOperation)
+        );
+
+        let mut decoder = KissRxState::new();
+        let mut oversized = vec![KISS_FEND, KISS_DATA];
+        oversized.extend(core::iter::repeat_n(0, KISS_MAX_FRAME_SIZE + 1));
+        oversized.push(KISS_FEND);
+        assert_eq!(
+            receive_bytes(iface_id, &mut decoder, &oversized).await,
+            Err(Error::BufferOverflow)
+        );
     }
 
     #[tokio::test]
@@ -455,6 +553,16 @@ mod tests {
         )
         .unwrap();
         let mut decoder = KissRxState::new();
+
+        #[cfg(feature = "kiss_crc")]
+        {
+            let mut corrupt = encoded[..length].to_vec();
+            corrupt[2] ^= 1;
+            assert_eq!(
+                receive_bytes(iface_id, &mut decoder, &corrupt).await,
+                Err(Error::CRC32)
+            );
+        }
 
         receive_bytes(iface_id, &mut decoder, &encoded[..3])
             .await

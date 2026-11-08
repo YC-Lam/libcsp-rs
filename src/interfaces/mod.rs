@@ -1,4 +1,5 @@
 pub mod can;
+pub mod canfd;
 pub mod i2c;
 pub mod kiss;
 pub(crate) mod loopback;
@@ -6,6 +7,7 @@ pub(crate) mod loopback;
 pub mod zmq;
 
 pub use can::CanInterface;
+pub use canfd::CanFdInterface;
 pub use i2c::I2cInterface;
 pub use kiss::KissInterface;
 #[cfg(feature = "zmq")]

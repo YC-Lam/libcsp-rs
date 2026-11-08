@@ -4,10 +4,9 @@ use bitflags::bitflags;
 
 use crate::arch::Queue;
 use crate::conn::{CSP_CONN_RXQUEUE_LEN, Connection};
-use crate::id::get_max_port;
 use crate::{CSP_ANY, Error, Packet};
 
-const CSP_PORT_MAX_BIND: usize = get_max_port();
+pub(crate) const CSP_PORT_MAX_BIND: usize = 16;
 
 /* We rely on the .bss section to clear this, so there is no csp_port_init() function */
 static mut PORTS: [Port; CSP_PORT_MAX_BIND + 2] = unsafe { core::mem::zeroed() };
@@ -203,6 +202,10 @@ impl Socket {
     }
 
     pub fn bind(&mut self, port: u8) -> Result<(), Error> {
+        if self.slot.is_some() {
+            return Err(Error::InvalidOperation);
+        }
+
         let mut port = port as usize;
 
         if port == CSP_ANY as usize {
@@ -246,13 +249,14 @@ impl Socket {
             }
         }
     }
-
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CSP_PORT_MAX_BIND, Port, Socket, SocketOptions, get_socket};
-    use crate::{CSP_ANY, Error};
+    use super::{CSP_PORT_MAX_BIND, ConnOrPacket, Port, Socket, SocketOptions, get_socket};
+    use crate::conn::{ConnType, Connection};
+    use crate::id::{CspId, Flags, Priority};
+    use crate::{CSP_ANY, Error, Packet};
     use serial_test::serial;
     use std::vec;
 
@@ -268,6 +272,12 @@ mod tests {
         assert!(state.is_conn_less());
         assert!(state.is_ready_to_recieve());
         assert!(state.options().contains(SocketOptions::CSP_SO_CONN_LESS));
+        assert_eq!(
+            socket.bind((CSP_PORT_MAX_BIND - 1) as u8),
+            Err(Error::InvalidOperation)
+        );
+        assert!(core::ptr::eq(get_socket(port).unwrap(), state));
+        assert!(get_socket((CSP_PORT_MAX_BIND - 1) as u8).is_none());
 
         let mut duplicate = Socket::new();
         assert_eq!(duplicate.bind(port), Err(Error::PortBusy));
@@ -291,6 +301,40 @@ mod tests {
         socket.listen(1).unwrap();
         assert!(state.is_ready_to_recieve());
 
+        socket.close().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn socket_read_apis_reject_wrong_queue_item_types() {
+        let mut socket = Socket::new_connectionless();
+        socket.bind((CSP_PORT_MAX_BIND - 2) as u8).unwrap();
+        let state = socket.state().unwrap();
+        assert!(matches!(
+            state
+                .rx_queue
+                .try_push(ConnOrPacket::Packet(Packet::get().unwrap())),
+            Ok(())
+        ));
+        assert_eq!(socket.accept(0).await.err(), Some(Error::InvalidOperation));
+
+        let id = CspId {
+            prio: Priority::Normal,
+            flags: Flags::empty(),
+            src: 1,
+            dst: 2,
+            dport: 3,
+            sport: 4,
+        };
+        let conn = Connection::new(id, id, ConnType::Server).await.unwrap();
+        assert!(matches!(
+            state.rx_queue.try_push(ConnOrPacket::Connection(conn)),
+            Ok(())
+        ));
+        assert_eq!(
+            socket.recv_packet(0).await.err(),
+            Some(Error::InvalidOperation)
+        );
         socket.close().await;
     }
 

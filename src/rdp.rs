@@ -317,12 +317,16 @@ async fn send_syn(conn: &mut Connection) -> Result<(), Error> {
 }
 
 #[inline]
-async fn receive_data(conn: &mut Connection, mut packet: Packet) {
+fn receive_data(conn: &mut Connection, mut packet: Packet) -> Result<(), Error> {
     /* Remove RDP header before passing to userspace */
     RdpHeader::remove(&mut packet);
 
     /* Enqueue data */
-    conn.enqueue_package(Some(packet)).await;
+    conn.try_enqueue_package(Some(packet))
+        .map_err(|(error, packet)| {
+            drop(packet);
+            error
+        })
 }
 
 #[inline]
@@ -341,7 +345,7 @@ async fn rx_queue_flush(conn: &mut Connection) {
         if let Some(packet) = rdp_queue::rx_try_get_filtered(conn.connection_id(), filter).await {
             #[cfg(feature = "defmt")]
             defmt::trace!("RDP deliver in-order seq={=u16}", next_seq_nr as u16);
-            receive_data(conn, packet).await;
+            let _ = receive_data(conn, packet);
             conn.rdp_connection_mut().rcv_cur = seq_add(conn.rdp_connection().rcv_cur, 1);
 
             // Loop from first element again
@@ -951,10 +955,16 @@ pub(crate) async fn new_packet(
                 if !conn.socket_delivered() {
                     if let Some(sock) = dest_sock {
                         /* Try queueing */
-                        sock.rx_queue
-                            .push(ConnOrPacket::Connection(unsafe { core::ptr::read(conn) }))
-                            .await
-                            .unwrap();
+                        let queued_conn = unsafe { core::ptr::read(conn) };
+                        if let Err((_, queued)) = sock
+                            .rx_queue
+                            .try_push(ConnOrPacket::Connection(queued_conn))
+                        {
+                            if let ConnOrPacket::Packet(packet) = queued {
+                                drop(packet);
+                            }
+                            return discard_close(conn, closed_by, packet, true).await;
+                        }
                     }
 
                     /* Ensure that this connection will not be posted to this socket again
@@ -1000,7 +1010,9 @@ pub(crate) async fn new_packet(
             let seq_nr = rx_header.seq_nr;
 
             /* Receive data */
-            receive_data(conn, packet).await;
+            if receive_data(conn, packet).is_err() {
+                return close_connection;
+            }
 
             /* Update last received packet */
             conn.rdp_connection_mut().rcv_cur = seq_nr;

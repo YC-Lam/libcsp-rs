@@ -107,8 +107,8 @@ pub(crate) fn csp_input_hook(iface: &mut InterfacePrivate, packet: &Packet) {
 
 /* Deliver the packet to a connection-less socket.  The socket is the
  * endpoint, so delivery terminates here. */
-async fn deliver_conn_less(socket: &SocketState, packet: Packet) {
-    let _ = socket.rx_queue.push(ConnOrPacket::Packet(packet)).await;
+fn deliver_conn_less(socket: &SocketState, packet: Packet) {
+    let _ = socket.rx_queue.try_push(ConnOrPacket::Packet(packet));
 }
 
 /**
@@ -124,6 +124,8 @@ async fn deliver_connection(
     socket: Option<&SocketState>,
     packet: Packet,
 ) {
+    let is_new_connection = conn.is_none();
+
     /* If this is an incoming packet on a new connection */
     let mut conn = if let Some(c) = conn {
         c
@@ -162,23 +164,35 @@ async fn deliver_connection(
     }
 
     /* Otherwise, enqueue directly */
-    conn.enqueue_package(Some(packet)).await;
+    if conn.try_enqueue_package(Some(packet)).is_err() {
+        if is_new_connection {
+            conn.close().await;
+        }
+        return;
+    }
 
     /* Try to queue up the new connection pointer */
     if !conn.socket_delivered() {
         if let Some(socket) = socket {
             conn.set_socket_deliverd(true);
-            let _ = socket.rx_queue.push(ConnOrPacket::Connection(conn)).await;
+            if let Err((_, ConnOrPacket::Connection(mut conn))) =
+                socket.rx_queue.try_push(ConnOrPacket::Connection(conn))
+            {
+                conn.close().await;
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::security_check;
+    use super::{deliver_conn_less, security_check};
+    use crate::conn::{ConnType, Connection};
     use crate::interfaces::InterfacePrivate;
-    use crate::port::SocketOptions;
-    use crate::{Error, Flags, Packet};
+    use crate::port::{SocketOptions, SocketState};
+    use crate::{Error, Flags, Packet, Priority};
+    use serial_test::serial;
+    use std::vec;
 
     #[test]
     fn required_crc_is_rejected_when_packet_has_no_crc_flag() {
@@ -204,6 +218,88 @@ mod tests {
             Err(Error::CRC32)
         );
         assert_eq!(iface.rx_error, 1);
+    }
+
+    #[test]
+    fn valid_crc_is_removed_before_socket_delivery() {
+        let mut iface = InterfacePrivate::new();
+        let mut packet = Packet::get().unwrap();
+        packet.append_data(b"payload").unwrap();
+        packet.id.flags |= Flags::CRC32;
+        packet.append_crc32().unwrap();
+
+        assert_eq!(
+            security_check(SocketOptions::empty(), &mut iface, &mut packet),
+            Ok(())
+        );
+        assert_eq!(packet.data(), b"payload");
+        assert_eq!(iface.rx_error, 0);
+    }
+
+    #[cfg(feature = "hmac")]
+    #[test]
+    fn required_hmac_is_rejected_when_packet_has_no_hmac_flag() {
+        let mut iface = InterfacePrivate::new();
+        let mut packet = Packet::get().unwrap();
+
+        assert_eq!(
+            security_check(SocketOptions::CSP_SO_HMACREQ, &mut iface, &mut packet),
+            Err(Error::HMAC)
+        );
+        assert_eq!(iface.autherr, 1);
+    }
+
+    #[cfg(feature = "rdp")]
+    #[test]
+    fn required_rdp_is_rejected_when_packet_has_no_rdp_flag() {
+        let mut iface = InterfacePrivate::new();
+        let mut packet = Packet::get().unwrap();
+
+        assert_eq!(
+            security_check(SocketOptions::CSP_SO_RDPREQ, &mut iface, &mut packet),
+            Err(Error::InvalidOperation)
+        );
+        assert_eq!(iface.rx_error, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn connectionless_delivery_drops_new_packet_when_receive_queue_is_full() {
+        let socket = SocketState::new();
+        for index in 0..8 {
+            let id = crate::id::CspId {
+                prio: Priority::Normal,
+                flags: Flags::empty(),
+                src: index,
+                dst: 0,
+                dport: 1,
+                sport: index as u8,
+            };
+            let conn = Connection::new(id, id, ConnType::Server).await.unwrap();
+            assert!(matches!(
+                socket
+                    .rx_queue
+                    .try_push(crate::port::ConnOrPacket::Connection(conn)),
+                Ok(())
+            ));
+        }
+        for _ in 0..8 {
+            assert!(matches!(
+                socket
+                    .rx_queue
+                    .try_push(crate::port::ConnOrPacket::Packet(Packet::get().unwrap())),
+                Ok(())
+            ));
+        }
+
+        deliver_conn_less(&socket, Packet::get().unwrap());
+        for _ in 0..crate::conn::CSP_CONN_RXQUEUE_LEN {
+            match socket.rx_queue.try_pop().unwrap() {
+                crate::port::ConnOrPacket::Connection(mut conn) => conn.close().await,
+                crate::port::ConnOrPacket::Packet(packet) => drop(packet),
+            }
+        }
+        assert!(socket.rx_queue.try_pop().is_none());
     }
 }
 
@@ -370,7 +466,7 @@ pub async fn route_work() {
      * match. */
     if socket.is_some_and(|s| s.is_conn_less()) {
         /* Connection-less delivery, the socket is the endpoint */
-        deliver_conn_less(socket.unwrap(), packet).await;
+        deliver_conn_less(socket.unwrap(), packet);
     } else {
         /* Connection-oriented delivery, a connection is the
          * endpoint and the socket, when present, only accepts new

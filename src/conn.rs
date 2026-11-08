@@ -8,10 +8,10 @@ use crate::id::CspId;
 use crate::rdp::{CSP_RDP_CLOSED_BY_USERSPACE, RdpConnection};
 #[cfg(not(feature = "rdp"))]
 const CSP_RDP_CLOSED_BY_USERSPACE: u8 = 0;
+use crate::port::CSP_PORT_MAX_BIND;
 use crate::*;
 
 pub(crate) const CSP_CONN_RXQUEUE_LEN: usize = 16;
-const CSP_PORT_MAX_BIND: u8 = 16;
 const CSP_CONN_MAX: usize = 8;
 
 /// Connection pool
@@ -84,7 +84,11 @@ impl ConnState {
 
 #[cfg(test)]
 mod tests {
-    use super::ConnState;
+    use super::{ConnState, ConnType, Connection};
+    use crate::id::{CspId, Flags, Priority};
+    use crate::{Error, Packet};
+    use serial_test::serial;
+    use std::vec;
 
     #[test]
     fn connection_state_requires_cleanup_before_reopening() {
@@ -114,6 +118,33 @@ mod tests {
 
         state.set_closed();
         assert!(state.try_open());
+    }
+
+    fn test_id() -> CspId {
+        CspId {
+            prio: Priority::Normal,
+            flags: Flags::empty(),
+            src: 1,
+            dst: 2,
+            dport: 3,
+            sport: 4,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn connection_read_reports_timeout_packet_and_close() {
+        let id = test_id();
+        let mut conn = Connection::new(id, id, ConnType::Client).await.unwrap();
+        assert_eq!(conn.read(0).await.err(), Some(Error::Timeout));
+
+        let mut packet = Packet::get().unwrap();
+        packet.append_data(b"queued").unwrap();
+        assert!(matches!(conn.try_enqueue_package(Some(packet)), Ok(())));
+        assert_eq!(conn.read(0).await.unwrap().data(), b"queued");
+
+        conn.close().await;
+        assert_eq!(conn.read(1).await.err(), Some(Error::ConnectionClosed));
     }
 }
 
@@ -207,7 +238,7 @@ impl ConnectionBuf {
                 dport: 0,
                 sport: 0,
             },
-            sport_outgoing: CSP_PORT_MAX_BIND + 1 + index as u8,
+            sport_outgoing: CSP_PORT_MAX_BIND as u8 + 1 + index as u8,
             rx_queue: Queue::new(),
             socket_delivered: AtomicBool::new(false),
             timestamp: 0,
@@ -435,6 +466,13 @@ impl Connection {
         let _ = self.inner.rx_queue.push(packet).await;
     }
 
+    pub(crate) fn try_enqueue_package(
+        &self,
+        packet: Option<Packet>,
+    ) -> Result<(), (Error, Option<Packet>)> {
+        self.inner.rx_queue.try_push(packet)
+    }
+
     pub(crate) async fn flush_rx_queue(&self) {
         // flush packet queue
         while let Some(Some(package)) = self.inner.rx_queue.try_pop() {
@@ -469,8 +507,7 @@ impl Connection {
         self.inner.rx_queue.close();
 
         #[cfg(feature = "rdp")]
-        if self.inner.idin.flags.contains(Flags::RDP)
-            || self.inner.idout.flags.contains(Flags::RDP)
+        if self.inner.idin.flags.contains(Flags::RDP) || self.inner.idout.flags.contains(Flags::RDP)
         {
             let _ = crate::rdp::close(self, closed_by).await;
         }
@@ -566,8 +603,7 @@ impl Connection {
     pub(crate) fn is_active(&self) -> bool {
         // This is for sure an RDP connection
         #[cfg(feature = "rdp")]
-        if self.inner.idin.flags.contains(Flags::RDP)
-            || self.inner.idout.flags.contains(Flags::RDP)
+        if self.inner.idin.flags.contains(Flags::RDP) || self.inner.idout.flags.contains(Flags::RDP)
         {
             return crate::rdp::conn_is_active(self);
         }

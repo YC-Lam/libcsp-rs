@@ -5,6 +5,9 @@ use embassy_sync::semaphore::{GreedySemaphore, Semaphore as _};
 
 use crate::Error;
 
+#[cfg(feature = "rtable")]
+pub type Mutex<T> = embassy_sync::mutex::Mutex<CriticalSectionRawMutex, T>;
+
 pub fn get_ms() -> u32 {
     embassy_time::Instant::now().as_millis() as u32
 }
@@ -39,6 +42,20 @@ impl<T, const N: usize> Queue<T, N> {
         }
 
         Ok(())
+    }
+
+    pub fn try_push(&self, item: T) -> Result<(), (Error, T)> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err((Error::ConnectionClosed, item));
+        }
+
+        match self.inner.try_send(Some(item)) {
+            Ok(()) => Ok(()),
+            Err(embassy_sync::channel::TrySendError::Full(Some(item))) => {
+                Err((Error::BufferOverflow, item))
+            }
+            Err(embassy_sync::channel::TrySendError::Full(None)) => unreachable!(),
+        }
     }
 
     pub fn try_pop(&self) -> Option<T> {

@@ -232,6 +232,22 @@ mod tests {
         assert_eq!(frames[0].1, expected);
     }
 
+    #[test]
+    fn transmit_masks_explicit_next_hop_to_seven_bits() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut iface = I2cInterface::new(1, 14, "I2C", false, TestDriver(Some(sent.clone())));
+        let packet = test_packet();
+        let mut state = TxState::default();
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        assert_eq!(
+            iface.poll_tx(&mut cx, Some(0x1ff), &packet, &mut state),
+            Poll::Ready(Ok(()))
+        );
+        assert_eq!(sent.lock().unwrap()[0].0, 0x7f);
+    }
+
     #[tokio::test]
     #[serial]
     #[allow(static_mut_refs)]

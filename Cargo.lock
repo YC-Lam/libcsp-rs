@@ -337,6 +337,7 @@ name = "csp"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.2",
+ "cortex-m-rt",
  "defmt",
  "embassy-executor",
  "embassy-futures",

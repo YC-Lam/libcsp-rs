@@ -80,13 +80,7 @@ async fn can_interface_transmits_fragments_and_routes_received_packets() {
     let mut tx_socket = UdpSocket::bind(10).await.unwrap();
     assert_eq!(
         tx_socket
-            .send_to(
-                Priority::High,
-                0x2001,
-                20,
-                ConnOptions::NONE,
-                b"12345",
-            )
+            .send_to(Priority::High, 0x2001, 20, ConnOptions::NONE, b"12345",)
             .await,
         Ok(5)
     );
@@ -110,8 +104,8 @@ async fn can_interface_transmits_fragments_and_routes_received_packets() {
     route_work().await;
 
     // Feed the matching begin/end fragments and verify the reassembled datagram's data and peer.
-    let mut rx_socket = UdpSocket::bind(42).await.unwrap();
-    let header = csp_header(Priority::Normal, 0x2000, 0x123, 42, 7);
+    let mut rx_socket = UdpSocket::bind(16).await.unwrap();
+    let header = csp_header(Priority::Normal, 0x2000, 0x123, 16, 7);
     let mut first_data = header[2..].to_vec();
     first_data.extend_from_slice(b"can-");
     receive(

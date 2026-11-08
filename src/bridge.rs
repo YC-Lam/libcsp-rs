@@ -55,3 +55,30 @@ pub async fn bridge_work() {
         let _ = crate::io::send_direct_iface(&id, packet, iface.private(), None, false).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{bridge_set_interfaces, bridge_work};
+    use crate::interfaces::INTERFACES;
+    use serial_test::serial;
+    use std::vec;
+
+    #[tokio::test]
+    #[serial]
+    async fn bridge_work_handles_unconfigured_and_configured_paths() {
+        bridge_work().await;
+
+        let loopback = INTERFACES.get_or_init().into_iter().next().unwrap();
+        let iface_id = loopback.id();
+        bridge_set_interfaces(iface_id, iface_id);
+
+        let mut packet = crate::Packet::get().unwrap();
+        packet.append_data(b"bridge coverage").unwrap();
+        crate::qfifo::write(packet, iface_id).await;
+        bridge_work().await;
+
+        let forwarded = crate::qfifo::read().await.unwrap();
+        assert_eq!(forwarded.iface, iface_id);
+        assert_eq!(forwarded.packet.data(), b"bridge coverage");
+    }
+}

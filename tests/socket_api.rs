@@ -5,22 +5,22 @@ use csp::{
 
 #[tokio::test]
 async fn listener_stream_udp_and_sfp_apis_work_over_loopback() {
-    let listener = CspListener::bind(20).await.unwrap();
-    assert_eq!(listener.local_port(), csp::SocketPort::Port(20));
+    let listener = CspListener::bind(12).await.unwrap();
+    assert_eq!(listener.local_port(), csp::SocketPort::Port(12));
     assert_eq!(listener.accept(0).await.err(), Some(Error::Timeout));
 
     // Pump the router explicitly so each loopback send is delivered before the matching read.
-    let mut client = CspStream::connect(Priority::Normal, 0, 20, ConnOptions::NONE)
+    let mut client = CspStream::connect(Priority::Normal, 0, 12, ConnOptions::NONE)
         .await
         .unwrap();
     assert_eq!(client.peer_addr(), 0);
-    assert_eq!(client.peer_port(), 20);
+    assert_eq!(client.peer_port(), 12);
     assert_eq!(client.send(b"request").await, Ok(7));
     csp::route_work().await;
 
     let mut server = listener.accept(1_000).await.unwrap();
     assert_eq!(server.peer_addr(), 0);
-    assert_eq!(server.local_port(), 20);
+    assert_eq!(server.local_port(), 12);
     let mut request = [0; 16];
     let length = server.read(&mut request, 1_000).await.unwrap();
     assert_eq!(&request[..length], b"request");
@@ -33,13 +33,13 @@ async fn listener_stream_udp_and_sfp_apis_work_over_loopback() {
     server.close().await;
     client.close().await;
 
-    let mut datagram_receiver = UdpSocket::bind(21).await.unwrap();
-    let mut datagram_sender = UdpSocket::bind(22).await.unwrap();
-    assert_eq!(UdpSocket::bind(21).await.err(), Some(Error::PortBusy));
-    assert_eq!(datagram_sender.local_port(), 22);
+    let mut datagram_receiver = UdpSocket::bind(13).await.unwrap();
+    let mut datagram_sender = UdpSocket::bind(14).await.unwrap();
+    assert_eq!(UdpSocket::bind(13).await.err(), Some(Error::PortBusy));
+    assert_eq!(datagram_sender.local_port(), 14);
     assert_eq!(
         datagram_sender
-            .send_to(Priority::High, 0, 21, ConnOptions::NONE, b"datagram",)
+            .send_to(Priority::High, 0, 13, ConnOptions::NONE, b"datagram",)
             .await,
         Ok(8)
     );
@@ -51,10 +51,10 @@ async fn listener_stream_udp_and_sfp_apis_work_over_loopback() {
         .unwrap();
     assert_eq!(&datagram[..length], b"datagram");
     assert_eq!(peer.addr, 0);
-    assert_eq!(peer.port, 22);
+    assert_eq!(peer.port, 14);
     datagram_receiver.close().await;
     datagram_sender.close().await;
-    let mut rebound_socket = UdpSocket::bind(21).await.unwrap();
+    let mut rebound_socket = UdpSocket::bind(13).await.unwrap();
     rebound_socket.close().await;
     assert_eq!(
         UdpSocket::bind(CSP_ANY).await.err(),
@@ -62,9 +62,9 @@ async fn listener_stream_udp_and_sfp_apis_work_over_loopback() {
     );
 
     // SFP splits a message into 8-byte chunks and reassembles them at the listener.
-    let sfp_listener = SfpListener::bind(23).await.unwrap();
-    assert_eq!(sfp_listener.local_port(), csp::SocketPort::Port(23));
-    let mut sfp_client = SfpStream::connect(Priority::Normal, 0, 23, ConnOptions::NONE)
+    let sfp_listener = SfpListener::bind(15).await.unwrap();
+    assert_eq!(sfp_listener.local_port(), csp::SocketPort::Port(15));
+    let mut sfp_client = SfpStream::connect(Priority::Normal, 0, 15, ConnOptions::NONE)
         .await
         .unwrap();
     assert_eq!(sfp_client.max_mtu().unwrap(), 248);

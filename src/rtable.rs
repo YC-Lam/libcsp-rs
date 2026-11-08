@@ -1,4 +1,4 @@
-use crate::arch::Mutex;
+use crate::arch::{LazyLock, Mutex};
 use crate::interfaces::InterfaceID;
 use crate::{Error, id};
 
@@ -99,7 +99,7 @@ impl RouteList {
     }
 }
 
-static ROUTES: Mutex<RouteTable> = Mutex::new(RouteTable::new());
+static ROUTES: LazyLock<Mutex<RouteTable>> = LazyLock::new(|| Mutex::new(RouteTable::new()));
 
 fn matches_prefix(route_address: u16, netmask: u16, address: u16) -> bool {
     let host_bits = id::get_host_bits() - netmask as usize;

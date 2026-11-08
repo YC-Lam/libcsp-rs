@@ -25,15 +25,18 @@ pub(crate) async fn read() -> Option<Qfifo> {
 pub(crate) async fn write(packet: Packet, iface: InterfaceID) {
     let qfifo = Qfifo { iface, packet };
 
-    QFIFO_QUEUE.push(qfifo).await.unwrap();
+    let _ = QFIFO_QUEUE.try_push(qfifo);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{read, write};
     use crate::{Packet, interfaces::INTERFACES};
+    use serial_test::serial;
+    use std::vec;
 
     #[tokio::test]
+    #[serial]
     async fn queue_preserves_packet_and_interface() {
         let iface = INTERFACES.get_or_init().into_iter().next().unwrap().id();
         let mut packet = Packet::get().unwrap();

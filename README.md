@@ -166,5 +166,7 @@ add_interface(iface);
 
 KISS frames use command `0x00` (TNC data), escape `0xC0` and `0xDB` according
 to the KISS wire format, and contain a packed six-byte CSP header followed by
-the packet payload. CRC32 behavior is controlled by the CSP packet flags and
-handled by the CSP router.
+the packet payload. The default `kiss_crc` Cargo feature also appends and
+verifies libcsp's link-level CRC32 over the packed header and payload. This is
+separate from the packet CRC selected by CSP flags. Disable `kiss_crc` when
+communicating with a libcsp build configured with `CSP_ENABLE_KISS_CRC=OFF`.

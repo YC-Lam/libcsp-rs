@@ -5,6 +5,9 @@ use core::time::Duration;
 
 use crate::Error;
 
+#[cfg(feature = "rtable")]
+pub type Mutex<T> = tokio::sync::Mutex<T>;
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn get_ms() -> u32 {
     unsafe {
@@ -102,6 +105,13 @@ impl<T, const N: usize> Queue<T, N> {
             .map_err(|_| Error::ConnectionClosed)
     }
 
+    pub fn try_push(&self, item: T) -> Result<(), (Error, T)> {
+        self.inner.0.try_send(item).map_err(|error| match error {
+            smol::channel::TrySendError::Full(item) => (Error::BufferOverflow, item),
+            smol::channel::TrySendError::Closed(item) => (Error::ConnectionClosed, item),
+        })
+    }
+
     pub fn try_pop(&self) -> Option<T> {
         self.inner.1.try_recv().ok()
     }
@@ -122,7 +132,11 @@ impl<T, const N: usize> Queue<T, N> {
     }
 
     pub fn free_capacity(&self) -> usize {
-        usize::MAX
+        self.inner
+            .0
+            .capacity()
+            .map(|capacity| capacity.saturating_sub(self.inner.0.len()))
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -189,6 +203,30 @@ impl Semaphore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn try_push_returns_when_the_queue_is_full() {
+        let queue = Queue::<u8, 1>::new();
+
+        assert_eq!(queue.try_push(1), Ok(()));
+        assert_eq!(queue.try_push(2), Err((Error::BufferOverflow, 2)));
+        assert_eq!(queue.try_pop(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn queue_tracks_capacity_timeout_and_close() {
+        let queue = Queue::<u8, 2>::new();
+
+        assert_eq!(queue.free_capacity(), 2);
+        assert_eq!(queue.pop_with_timeout(0).await, Err(Error::Timeout));
+        queue.push(1).await.unwrap();
+        assert_eq!(queue.free_capacity(), 1);
+        queue.close();
+
+        assert_eq!(queue.try_push(2), Err((Error::ConnectionClosed, 2)));
+        assert_eq!(queue.pop().await, Ok(1));
+        assert_eq!(queue.pop().await, Err(Error::ConnectionClosed));
+    }
 
     #[tokio::test]
     async fn semaphore_wait_consumes_and_post_releases_a_single_permit() {

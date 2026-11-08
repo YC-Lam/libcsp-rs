@@ -206,13 +206,8 @@ pub async fn shutdown(node: u16) -> Result<(), Error> {
 }
 
 async fn request_u32(node: u16, port: u8, timeout: u32) -> Result<u32, Error> {
-    let mut stream = CspStream::connect(
-        Priority::Normal,
-        node,
-        port,
-        crate::ConnOptions::CRC32,
-    )
-    .await?;
+    let mut stream =
+        CspStream::connect(Priority::Normal, node, port, crate::ConnOptions::CRC32).await?;
     stream.send(&[]).await?;
     let mut response = [0; 4];
     let result = stream.read(&mut response, timeout).await;
@@ -250,27 +245,74 @@ fn replace_data(packet: &mut Packet, data: &[u8]) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_hooks, handle};
-    use crate::{CSP_MEMFREE, CSP_PING, Error, Packet};
+    use super::*;
+    use crate::id::CspId;
+    use serial_test::serial;
+    use std::vec;
 
-    #[tokio::test]
-    async fn ping_is_handled_without_platform_hooks() {
-        clear_hooks();
+    fn make_packet(port: u8, data: &[u8]) -> Packet {
         let mut packet = Packet::get().unwrap();
-        packet.id.dport = CSP_PING;
-
-        assert_eq!(handle(&mut packet).await, Ok(Some(true)));
+        packet.id = CspId {
+            prio: crate::Priority::Normal,
+            flags: crate::Flags::empty(),
+            src: 0,
+            dst: 0,
+            dport: port,
+            sport: 0,
+        };
+        packet.append_data(data).unwrap();
+        packet
     }
 
     #[tokio::test]
-    async fn memory_service_requires_hooks_and_an_empty_request() {
+    #[serial]
+    async fn handler_rejects_bad_payloads_and_missing_platform_hooks() {
         clear_hooks();
-        let mut packet = Packet::get().unwrap();
-        packet.id.dport = CSP_MEMFREE;
+        let mut packet = make_packet(crate::CSP_MEMFREE, b"unexpected");
+        assert_eq!(handle(&mut packet).await, Err(Error::InvalidOperation));
 
+        let mut packet = make_packet(crate::CSP_MEMFREE, b"");
         assert_eq!(handle(&mut packet).await, Err(Error::FeatureDisabled));
 
-        packet.append_data(b"unexpected").unwrap();
+        let mut packet = make_packet(crate::CSP_PS, b"");
+        assert_eq!(handle(&mut packet).await, Err(Error::FeatureDisabled));
+
+        let mut packet = make_packet(crate::CSP_REBOOT, &[0; 3]);
         assert_eq!(handle(&mut packet).await, Err(Error::InvalidOperation));
+
+        let mut packet = make_packet(crate::CSP_PING, b"echo");
+        assert_eq!(handle(&mut packet).await, Ok(Some(true)));
+        assert_eq!(packet.data(), b"echo");
+    }
+
+    fn empty_process_list(output: &mut [u8]) -> Result<usize, Error> {
+        let _ = output;
+        Ok(0)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handler_rejects_empty_process_list_callback_output() {
+        static HOOKS: ServiceHooks = ServiceHooks {
+            identity: crate::cmp::Identity::empty(),
+            memory_free: None,
+            process_list: Some(empty_process_list),
+            reboot: None,
+            shutdown: None,
+            clock_get: None,
+            clock_set: None,
+        };
+        set_hooks(&HOOKS);
+        let mut packet = make_packet(crate::CSP_PS, b"");
+
+        assert_eq!(handle(&mut packet).await, Err(Error::InvalidOperation));
+        clear_hooks();
+    }
+
+    #[test]
+    fn replace_data_replaces_existing_payload() {
+        let mut packet = make_packet(crate::CSP_PING, b"old");
+        replace_data(&mut packet, b"new payload").unwrap();
+        assert_eq!(packet.data(), b"new payload");
     }
 }

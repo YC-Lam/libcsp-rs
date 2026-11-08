@@ -374,3 +374,54 @@ async fn set_route(address: u16, netmask: u16, name: &[u8], via: Option<u16>) ->
     let _ = (address, netmask, interface, via);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packet(payload: &[u8]) -> crate::Packet {
+        let mut packet = crate::Packet::get().unwrap();
+        packet.append_data(payload).unwrap();
+        packet
+    }
+
+    #[tokio::test]
+    async fn handle_rejects_malformed_and_unsupported_requests() {
+        for request in [
+            &[][..],
+            &[REQUEST][..],
+            &[1, IDENT][..],
+            &[REQUEST, 0xff][..],
+        ] {
+            assert_eq!(
+                handle(&mut packet(request)).await,
+                Err(Error::InvalidOperation)
+            );
+        }
+
+        assert_eq!(
+            handle(&mut packet(&[REQUEST, PEEK])).await,
+            Err(Error::FeatureDisabled)
+        );
+        assert_eq!(
+            handle(&mut packet(&[REQUEST, IDENT, 0])).await,
+            Err(Error::InvalidOperation)
+        );
+    }
+
+    #[test]
+    fn fixed_name_stops_at_nul_and_accepts_full_width_names() {
+        assert_eq!(fixed_name(b"IFACE\0padding"), b"IFACE");
+        assert_eq!(fixed_name(b"FULLWIDTH"), b"FULLWIDTH");
+        assert!(fixed_name(b"\0unused").is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_rejects_payload_that_cannot_fit_a_csp_packet() {
+        let mut message = [0; MAX_CMP_REQUEST];
+        assert_eq!(
+            request(0, 0, IDENT, &mut message).await,
+            Err(Error::BufferOverflow)
+        );
+    }
+}

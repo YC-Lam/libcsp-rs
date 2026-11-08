@@ -401,3 +401,59 @@ pub(crate) async fn send_service_reply(
     let id = packet.id;
     send_direct(&id, packet, None).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{send_service_reply, send_to};
+    use crate::conn::ConnOptions;
+    use crate::id::{CspId, Flags, Priority};
+    use crate::interfaces::INTERFACES;
+    use crate::{Error, Packet};
+    use serial_test::serial;
+    use std::vec;
+
+    #[tokio::test]
+    async fn connectionless_send_rejects_rdp() {
+        let packet = Packet::get().unwrap();
+        assert_eq!(
+            send_to(Priority::Normal, 0, 10, 11, ConnOptions::RDP, packet,).await,
+            Err(Error::InvalidOperation)
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn service_reply_reverses_endpoints_and_preserves_flags() {
+        let loopback = INTERFACES.get_or_init().into_iter().next().unwrap();
+        let mut request = Packet::get().unwrap();
+        request.id = CspId {
+            prio: Priority::High,
+            flags: Flags::CRC32,
+            src: 0,
+            dst: 0,
+            dport: 7,
+            sport: 8,
+        };
+        request.append_data(b"reply").unwrap();
+
+        send_service_reply(request, false).await.unwrap();
+
+        let mut reply = crate::qfifo::read().await.unwrap();
+        let id = reply.packet.id;
+        let prio = id.prio;
+        let flags = id.flags;
+        let src = id.src;
+        let dst = id.dst;
+        let sport = id.sport;
+        let dport = id.dport;
+        assert_eq!(reply.iface, loopback.id());
+        assert_eq!(prio, Priority::High);
+        assert!(flags.contains(Flags::CRC32));
+        assert_eq!(src, 0);
+        assert_eq!(dst, 0);
+        assert_eq!(sport, 7);
+        assert_eq!(dport, 8);
+        assert!(reply.packet.verify_crc32());
+        assert_eq!(reply.packet.data(), b"reply");
+    }
+}
