@@ -119,8 +119,10 @@ where
     F: FnOnce() -> T,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let ptr = self.get_or_init() as *const T;
-        return unsafe { (ptr as *mut T).as_mut_unchecked() };
+        self.get_or_init();
+        // SAFETY: get_or_init completed initialization, and &mut self guarantees
+        // exclusive access to the stored value.
+        unsafe { self.value.get_mut().assume_init_mut() }
     }
 }
 
@@ -140,5 +142,14 @@ mod tests {
         drop(lock);
 
         assert_eq!(i, 1);
+    }
+
+    #[test]
+    fn lazylock_deref_mut_initializes_and_mutates_value() {
+        let mut lock = LazyLock::new(|| 41);
+
+        *lock += 1;
+
+        assert_eq!(*lock, 42);
     }
 }

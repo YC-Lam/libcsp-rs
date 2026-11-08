@@ -91,6 +91,13 @@ pub(crate) fn get_interface_by_addr(addr: u16) -> Option<&'static mut dyn Interf
     return None;
 }
 
+pub(crate) fn address_is_local(addr: u16) -> bool {
+    INTERFACES
+        .get_or_init()
+        .into_iter()
+        .any(|iface| iface.inner().contains_address(addr))
+}
+
 pub(crate) fn interface_id_by_name(name: &[u8]) -> Option<InterfaceID> {
     for iface in INTERFACES.get_or_init() {
         if iface.name().as_bytes() == name {
@@ -223,6 +230,10 @@ pub trait Interface: Send + Sync + Any {
     /// Whether this packet should be delivered locally rather than transmitted.
     fn is_loopback_destination(&self, _packet: &Packet) -> bool {
         false
+    }
+    /// Whether this interface owns the address, including any aliases.
+    fn contains_address(&self, addr: u16) -> bool {
+        self.addr() == addr
     }
     /// Process one received frame. Implementations return a packet only when it is complete.
     #[doc(hidden)]
@@ -532,12 +543,14 @@ mod tests {
 
     struct TestInterface {
         private_: InterfacePrivate,
+        alias: Option<u16>,
     }
 
     impl TestInterface {
         const fn new() -> Self {
             Self {
                 private_: InterfacePrivate::new(),
+                alias: None,
             }
         }
     }
@@ -559,6 +572,10 @@ mod tests {
             false
         }
 
+        fn contains_address(&self, addr: u16) -> bool {
+            addr == 10 || self.alias == Some(addr)
+        }
+
         fn next_hop(
             &mut self,
             _via: Option<u16>,
@@ -568,8 +585,9 @@ mod tests {
             unimplemented!()
         }
 
-        fn alias_add(&mut self, _addr: u16) -> Result<(), Error> {
-            unimplemented!()
+        fn alias_add(&mut self, addr: u16) -> Result<(), Error> {
+            self.alias = Some(addr);
+            Ok(())
         }
 
         fn private(&mut self) -> &mut InterfacePrivate {
@@ -621,6 +639,23 @@ mod tests {
         assert!(interface_id_by_name(b"eth0").is_none());
         assert_eq!(get_interface_by_addr(0).unwrap().name(), "LOOP");
         assert!(get_interface_by_isdfl().is_none());
+    }
+
+    #[test]
+    #[serial]
+    #[allow(static_mut_refs)]
+    fn address_lookup_includes_interface_aliases() {
+        INTERFACES.get_or_init().clear();
+        static mut IFACE: TestInterface = TestInterface::new();
+
+        unsafe {
+            IFACE.alias_add(11).unwrap();
+            add_interface(&mut IFACE);
+        }
+
+        assert!(address_is_local(10));
+        assert!(address_is_local(11));
+        assert!(!address_is_local(12));
     }
 
     #[tokio::test]

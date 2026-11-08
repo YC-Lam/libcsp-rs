@@ -332,6 +332,10 @@ impl<D: CanInterfaceDriver> Interface for CanFdInterface<D> {
         self.is_local_address(packet.id.dst)
     }
 
+    fn contains_address(&self, addr: u16) -> bool {
+        self.is_local_address(addr)
+    }
+
     fn process_rx_frame(
         &mut self,
         id: u32,

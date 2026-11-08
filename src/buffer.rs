@@ -1,3 +1,4 @@
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::Error;
@@ -77,31 +78,26 @@ impl PacketBuf {
     }
 
     /// allocate packet from packet pool
-    fn get() -> Option<&'static mut Self> {
-        // loop through
+    fn get() -> Option<NonNull<Self>> {
+        let pool = core::ptr::addr_of_mut!(PACKET_POOL).cast::<PacketBuf>();
         for i in 0..CSP_BUFFER_COUNT {
-            // unsafe required to access packet pool
-            let packet = unsafe { &mut PACKET_POOL[i] };
-
-            packet.index = i;
-
-            if packet
-                .ref_count
+            // SAFETY: Each pointer addresses a distinct static pool entry. The
+            // atomic reference count arbitrates exclusive ownership before the
+            // entry's non-atomic fields are accessed.
+            let packet = unsafe { pool.add(i) };
+            let ref_count = unsafe { &(*packet).ref_count };
+            if ref_count
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                // store index
-                packet.index = i;
-
-                return Some(packet);
+                // SAFETY: This pointer addresses an entry in the static pool,
+                // and the successful compare_exchange reserves it for this Packet.
+                unsafe { (*packet).index = i };
+                return NonNull::new(packet);
             }
         }
 
         None
-    }
-
-    fn free(&mut self) {
-        self.ref_count.store(0, Ordering::Release);
     }
 
     /// initialise fields in packet
@@ -174,6 +170,11 @@ impl PacketBuf {
 
     pub fn data(&self) -> &[u8] {
         &self.data[..self.data_length()]
+    }
+
+    pub(crate) fn data_mut(&mut self) -> &mut [u8] {
+        let length = self.data_length();
+        &mut self.data[..length]
     }
 
     pub(crate) fn frame_length(&self) -> usize {
@@ -317,8 +318,15 @@ impl PacketBuf {
 }
 
 pub struct Packet {
-    inner: &'static mut PacketBuf,
+    inner: NonNull<PacketBuf>,
 }
+
+// SAFETY: A Packet uniquely owns its reserved pool entry. Moving that ownership
+// between threads cannot create another Packet or alias its mutable access.
+unsafe impl Send for Packet {}
+// SAFETY: Shared Packet access only exposes shared PacketBuf references.
+// Mutation still requires exclusive access to the Packet.
+unsafe impl Sync for Packet {}
 
 impl Packet {
     /// Allocate a packet from the fixed buffer pool.
@@ -341,19 +349,23 @@ impl core::ops::Deref for Packet {
     type Target = PacketBuf;
 
     fn deref(&self) -> &Self::Target {
-        self.inner
+        // SAFETY: The Packet retains exclusive ownership of this pool entry.
+        unsafe { self.inner.as_ref() }
     }
 }
 
 impl core::ops::DerefMut for Packet {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.inner
+        // SAFETY: &mut self guarantees unique access to the owned pool entry.
+        unsafe { self.inner.as_mut() }
     }
 }
 
 impl Drop for Packet {
     fn drop(&mut self) {
-        self.inner.free();
+        // SAFETY: This Packet owns the entry, and no packet access occurs after
+        // dropping it. The release store makes the entry available to allocators.
+        unsafe { self.inner.as_ref().ref_count.store(0, Ordering::Release) };
     }
 }
 

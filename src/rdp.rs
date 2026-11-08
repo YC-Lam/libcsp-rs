@@ -49,6 +49,7 @@ pub(crate) enum RdpState {
 }
 
 #[repr(packed)]
+#[derive(Clone, Copy)]
 struct RdpHeader {
     flags: RdpFlags,
     seq_nr: u16,
@@ -150,15 +151,32 @@ impl RdpHeader {
     }
 
     #[inline]
-    fn from_packet(packet: &Packet) -> &mut RdpHeader {
+    fn from_packet(packet: &mut Packet) -> &mut RdpHeader {
         debug_assert!(packet.data_length() >= size_of::<RdpHeader>());
+        let start = packet.data_length() - size_of::<RdpHeader>();
         unsafe {
-            let ptr = packet
-                .data()
-                .as_ptr()
-                .add(packet.data_length() - size_of::<RdpHeader>());
-            return (ptr as *mut RdpHeader).as_mut_unchecked();
+            let ptr = packet.data_mut().as_mut_ptr().add(start);
+            &mut *(ptr as *mut RdpHeader)
         }
+    }
+
+    #[inline]
+    fn read_from_packet(packet: &Packet) -> RdpHeader {
+        debug_assert!(packet.data_length() >= size_of::<RdpHeader>());
+        let start = packet.data_length() - size_of::<RdpHeader>();
+        let data = packet.data();
+        RdpHeader {
+            flags: RdpFlags::from_bits_retain(data[start]),
+            seq_nr: u16::from_ne_bytes([data[start + 1], data[start + 2]]),
+            ack_nr: u16::from_ne_bytes([data[start + 3], data[start + 4]]),
+        }
+    }
+
+    #[inline]
+    fn set_ack_nr(packet: &mut Packet, ack_nr: u16) {
+        debug_assert!(packet.data_length() >= size_of::<RdpHeader>());
+        let start = packet.data_length() - size_of::<u16>();
+        packet.data_mut()[start..].copy_from_slice(&ack_nr.to_be_bytes());
     }
 }
 
@@ -337,7 +355,7 @@ async fn rx_queue_flush(conn: &mut Connection) {
 
         let filter = |packet: &Packet| {
             // reference header
-            let header = RdpHeader::from_packet(&packet);
+            let header = RdpHeader::read_from_packet(packet);
             // If the matching packet was found:
             header.seq_nr == next_seq_nr as u16
         };
@@ -360,7 +378,7 @@ async fn rx_queue_flush(conn: &mut Connection) {
 async fn seq_in_rx_queue(conn_id: ConnectionID, seq_nr: u16) -> bool {
     let filter = |packet: &Packet| {
         // reference header
-        let header = RdpHeader::from_packet(&packet);
+        let header = RdpHeader::read_from_packet(packet);
         // check sequence number
         header.seq_nr == seq_nr
     };
@@ -515,7 +533,7 @@ pub(crate) async fn check_timeouts(conn: &mut Connection) {
     let packet_timeout = conn.rdp_connection().packet_timeout;
 
     let filter = |packet: &Packet| {
-        let header = RdpHeader::from_packet(&packet);
+        let header = RdpHeader::read_from_packet(packet);
         seq_before(u16::from_be(header.seq_nr), packet_seq)
             || time_after(time_now, time_deadline(packet.timestamp_tx, packet_timeout))
     };
@@ -523,10 +541,11 @@ pub(crate) async fn check_timeouts(conn: &mut Connection) {
     while let Some(mut packet) = rdp_queue::tx_try_get_filtered(conn.connection_id(), filter).await
     {
         /* Get header */
-        let header = RdpHeader::from_packet(&packet);
+        let header = RdpHeader::read_from_packet(&packet);
+        let sequence_number = u16::from_be(header.seq_nr);
 
         /* If acked, do not retransmit */
-        if seq_before(u16::from_be(header.seq_nr), conn.rdp_connection().snd_una) {
+        if seq_before(sequence_number, conn.rdp_connection().snd_una) {
             //csp_rdp_protocol("RDP %p: TX Element Free, time %" PRIu32 ", seq %u, una %u\n",
             //				 (void *)conn, packet.timestamp_tx, be16toh(header.seq_nr), conn.rdp_connection().snd_una);
             drop(packet);
@@ -538,15 +557,15 @@ pub(crate) async fn check_timeouts(conn: &mut Connection) {
             time_now,
             time_deadline(packet.timestamp_tx, conn.rdp_connection().packet_timeout),
         ) {
-            let Some(new_packet) = packet.buffer_clone() else {
+            let Some(mut new_packet) = packet.buffer_clone() else {
                 rdp_queue::tx_add(conn.connection_id(), packet).await;
                 continue;
             };
             #[cfg(feature = "defmt")]
-            defmt::warn!("RDP retransmit seq={=u16}", u16::from_be(header.seq_nr));
+            defmt::warn!("RDP retransmit seq={=u16}", sequence_number);
 
             /* Update to latest outgoing ACK */
-            header.ack_nr = conn.rdp_connection().rcv_cur.to_be();
+            RdpHeader::set_ack_nr(&mut new_packet, conn.rdp_connection().rcv_cur);
 
             /* Every outgoing message contains the last valid ACK number. So we always set last ack timestamp */
             conn.rdp_connection_mut().ack_timestamp = crate::arch::get_ms();
@@ -603,7 +622,7 @@ pub(crate) async fn new_packet(
     }
 
     /* Get RX header and convert to host byte-order */
-    let rx_header = RdpHeader::from_packet(&packet);
+    let mut rx_header = RdpHeader::read_from_packet(&packet);
     rx_header.ack_nr = u16::from_be(rx_header.ack_nr);
     rx_header.seq_nr = u16::from_be(rx_header.seq_nr);
     #[cfg(feature = "defmt")]
@@ -1451,12 +1470,33 @@ mod tests {
         header.seq_nr = 0x1234u16.to_be();
         header.ack_nr = 0x5678u16.to_be();
 
-        let header = RdpHeader::from_packet(&packet);
+        let header = RdpHeader::read_from_packet(&packet);
         assert_eq!(header.flags, RdpFlags::RDP_ACK);
         assert_eq!(u16::from_be(header.seq_nr), 0x1234);
         assert_eq!(u16::from_be(header.ack_nr), 0x5678);
 
         RdpHeader::remove(&mut packet);
         assert_eq!(packet.data(), b"payload");
+    }
+
+    #[test]
+    fn retransmission_ack_is_written_to_the_transmitted_copy() {
+        let mut packet = Packet::get().unwrap();
+        let header = RdpHeader::add(&mut packet).unwrap();
+        header.flags = RdpFlags::RDP_ACK;
+        header.seq_nr = 0x1234u16.to_be();
+        header.ack_nr = 0x5678u16.to_be();
+
+        let mut retransmission = packet.buffer_clone().unwrap();
+        RdpHeader::set_ack_nr(&mut retransmission, 0x9abc);
+
+        assert_eq!(
+            u16::from_be(RdpHeader::read_from_packet(&packet).ack_nr),
+            0x5678
+        );
+        assert_eq!(
+            u16::from_be(RdpHeader::read_from_packet(&retransmission).ack_nr),
+            0x9abc
+        );
     }
 }

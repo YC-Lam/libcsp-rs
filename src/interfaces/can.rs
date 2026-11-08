@@ -311,6 +311,10 @@ impl<D: CanInterfaceDriver> Interface for CanInterface<D> {
         self.is_local_address(packet.id.dst)
     }
 
+    fn contains_address(&self, addr: u16) -> bool {
+        self.is_local_address(addr)
+    }
+
     fn process_rx_frame(
         &mut self,
         id: u32,
@@ -842,6 +846,7 @@ mod tests {
         can.alias_add(0x345).unwrap();
         can.alias_add(0x345).unwrap();
         assert!(can.is_local_address(0x345));
+        assert!(can.contains_address(0x345));
         packet.id.dst = 0x345;
         assert!(can.is_loopback_destination(&packet));
         assert!(!can.is_local_address(0x456));

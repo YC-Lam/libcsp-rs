@@ -334,9 +334,7 @@ pub async fn route_work() {
     /* The packet is to me, if the address matches that of any interface,
      * or the address matches the broadcast address of the incoming interface */
     let is_broadcast = crate::id::is_broadcast(packet.id.dst, iface.addr(), iface.netmask());
-    let is_to_me =
-        crate::interfaces::get_interface_by_addr(packet.id.dst).is_some() || is_broadcast;
-    //todo: || csp_addr_is_alias(packet.id.dst);
+    let is_to_me = crate::interfaces::address_is_local(packet.id.dst) || is_broadcast;
 
     /* Deduplication */
     if cfg!(feature = "dedup_all")
