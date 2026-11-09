@@ -14,6 +14,8 @@ mod tokio;
 #[cfg(all(feature = "std", not(feature = "embassy")))]
 pub use tokio::*;
 
+pub(crate) mod allocator;
+
 const UNINIT: u8 = 0;
 const RUNNING: u8 = 1;
 const DONE: u8 = 2;

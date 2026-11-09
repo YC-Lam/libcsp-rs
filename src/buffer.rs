@@ -1,7 +1,5 @@
-use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 use crate::Error;
+use crate::arch::allocator::{StaticAllocator, StaticBox};
 use crate::conn::ConnectionID;
 use crate::crc32::CRC32;
 use crate::id::CspId;
@@ -11,17 +9,10 @@ pub(crate) const CSP_BUFFER_COUNT: usize = 15;
 
 const CSP_PACKET_PADDING_BYTES: usize = 8;
 
-/// static memory packet pool, packets are safe to be zeroed.
-/// initialisation is done by buffer_init()
-static mut PACKET_POOL: [PacketBuf; CSP_BUFFER_COUNT] = unsafe { core::mem::zeroed() };
+static PACKET_POOL: StaticAllocator<PacketBuf, CSP_BUFFER_COUNT> = StaticAllocator::new();
 
 #[repr(C)]
 pub struct PacketBuf {
-    /// reference counter
-    ref_count: AtomicUsize,
-    /// index in packet pool
-    index: usize,
-
     conn: Option<ConnectionID>,
 
     /// Time the message was sent
@@ -65,39 +56,32 @@ const _: () = {
 };
 
 impl PacketBuf {
-    pub(crate) fn remaining() -> usize {
-        let pool = core::ptr::addr_of!(PACKET_POOL).cast::<PacketBuf>();
-        // This is a concurrent count, so allocations may change it during the scan.
-        (0..CSP_BUFFER_COUNT)
-            .filter(|index| {
-                // SAFETY: Each pool entry has static storage and the atomic counter
-                // can be read independently while packets are allocated or released.
-                unsafe { (*pool.add(*index)).ref_count.load(Ordering::Acquire) == 0 }
-            })
-            .count()
+    const fn new() -> Self {
+        Self {
+            conn: None,
+            timestamp_tx: 0,
+            timestamp_rx: 0,
+            rx_count: 0,
+            remain: 0,
+            cfpid: 0,
+            last_used: 0,
+            id: CspId {
+                prio: crate::id::Priority::Critical,
+                flags: crate::id::Flags::empty(),
+                src: 0,
+                dst: 0,
+                dport: 0,
+                sport: 0,
+            },
+            header_length: 0,
+            length: 0,
+            header: [0; CSP_PACKET_PADDING_BYTES],
+            data: [0; CSP_BUFFER_SIZE],
+        }
     }
 
-    /// allocate packet from packet pool
-    fn get() -> Option<NonNull<Self>> {
-        let pool = core::ptr::addr_of_mut!(PACKET_POOL).cast::<PacketBuf>();
-        for i in 0..CSP_BUFFER_COUNT {
-            // SAFETY: Each pointer addresses a distinct static pool entry. The
-            // atomic reference count arbitrates exclusive ownership before the
-            // entry's non-atomic fields are accessed.
-            let packet = unsafe { pool.add(i) };
-            let ref_count = unsafe { &(*packet).ref_count };
-            if ref_count
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                // SAFETY: This pointer addresses an entry in the static pool,
-                // and the successful compare_exchange reserves it for this Packet.
-                unsafe { (*packet).index = i };
-                return NonNull::new(packet);
-            }
-        }
-
-        None
+    pub(crate) fn remaining() -> usize {
+        PACKET_POOL.available()
     }
 
     /// initialise fields in packet
@@ -318,20 +302,13 @@ impl PacketBuf {
 }
 
 pub struct Packet {
-    inner: NonNull<PacketBuf>,
+    inner: StaticBox<PacketBuf>,
 }
-
-// SAFETY: A Packet uniquely owns its reserved pool entry. Moving that ownership
-// between threads cannot create another Packet or alias its mutable access.
-unsafe impl Send for Packet {}
-// SAFETY: Shared Packet access only exposes shared PacketBuf references.
-// Mutation still requires exclusive access to the Packet.
-unsafe impl Sync for Packet {}
 
 impl Packet {
     /// Allocate a packet from the fixed buffer pool.
     pub fn get() -> Option<Self> {
-        let inner = PacketBuf::get()?;
+        let inner = PACKET_POOL.allocate(PacketBuf::new())?;
         let mut packet = Self { inner };
         packet.init();
         Some(packet)
@@ -349,23 +326,13 @@ impl core::ops::Deref for Packet {
     type Target = PacketBuf;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: The Packet retains exclusive ownership of this pool entry.
-        unsafe { self.inner.as_ref() }
+        &self.inner
     }
 }
 
 impl core::ops::DerefMut for Packet {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: &mut self guarantees unique access to the owned pool entry.
-        unsafe { self.inner.as_mut() }
-    }
-}
-
-impl Drop for Packet {
-    fn drop(&mut self) {
-        // SAFETY: This Packet owns the entry, and no packet access occurs after
-        // dropping it. The release store makes the entry available to allocators.
-        unsafe { self.inner.as_ref().ref_count.store(0, Ordering::Release) };
+        &mut self.inner
     }
 }
 
@@ -377,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_packet_frame() {
-        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
+        let mut packet = PacketBuf::new();
 
         packet.header = [0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         packet.header_length = 6;
@@ -398,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_packet_crc32() {
-        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
+        let mut packet = PacketBuf::new();
 
         packet.append_data(&[0xAA, 0xBB, 0xCC]).unwrap();
 
@@ -413,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_crc32_detects_payload_corruption() {
-        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
+        let mut packet = PacketBuf::new();
 
         packet.append_data(&[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
         packet.append_crc32().unwrap();
@@ -425,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_crc32_detects_crc_corruption() {
-        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
+        let mut packet = PacketBuf::new();
 
         packet.append_data(&[1, 2, 3, 4]).unwrap();
         packet.append_crc32().unwrap();
@@ -438,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_crc32_empty_payload() {
-        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
+        let mut packet = PacketBuf::new();
 
         packet.append_crc32().unwrap();
 
@@ -448,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_crc32_max_payload() {
-        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
+        let mut packet = PacketBuf::new();
 
         let data = [0x55; CSP_BUFFER_SIZE - 4];
 
@@ -461,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_crc32_no_room() {
-        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
+        let mut packet = PacketBuf::new();
 
         let data = [0x55; CSP_BUFFER_SIZE];
 
@@ -472,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_crc32_verify_too_short() {
-        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
+        let mut packet = PacketBuf::new();
 
         packet.append_data(&[1, 2, 3]).unwrap();
 
@@ -481,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_crc32_detects_header_corruption() {
-        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
+        let mut packet = PacketBuf::new();
 
         packet.append_data(&[1, 2, 3]).unwrap();
         packet.append_crc32().unwrap();
@@ -493,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_crc32_after_strip_id() {
-        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
+        let mut packet = PacketBuf::new();
 
         packet.append_data(&[1, 2, 3, 4]).unwrap();
         packet.append_crc32().unwrap();
@@ -505,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_append_data_overflow() {
-        let mut packet: PacketBuf = unsafe { core::mem::zeroed() };
+        let mut packet = PacketBuf::new();
 
         let data = [0u8; CSP_BUFFER_SIZE];
 
